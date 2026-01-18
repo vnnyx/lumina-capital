@@ -9,6 +9,8 @@ from typing import Any, Optional
 
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
 from src.application.agents.gemini_analyst import GeminiAnalystAgent
+from src.domain.ports.trading_port import TradingPort
+from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -96,6 +98,8 @@ class InvestmentCycleUseCase:
         self,
         analyst_agent: GeminiAnalystAgent,
         manager_agent: DeepSeekManagerAgent,
+        trading_port: TradingPort,
+        settings: Settings,
         top_coins_count: int = 200,
     ):
         """
@@ -104,10 +108,14 @@ class InvestmentCycleUseCase:
         Args:
             analyst_agent: Gemini analyst agent
             manager_agent: DeepSeek manager agent
+            trading_port: Trading port for portfolio access
+            settings: Application settings
             top_coins_count: Number of top coins to analyze
         """
         self.analyst = analyst_agent
         self.manager = manager_agent
+        self.trading = trading_port
+        self.settings = settings
         self.top_coins_count = top_coins_count
     
     async def run(
@@ -175,7 +183,37 @@ class InvestmentCycleUseCase:
         phase_start = datetime.now()
         
         try:
-            analyses = await self.analyst.analyze_top_coins(limit=self.top_coins_count)
+            # Fetch portfolio symbols to include in analysis
+            include_symbols: list[str] = []
+            if self.settings.include_portfolio_in_analysis:
+                try:
+                    portfolio = await self.trading.get_portfolio()
+                    min_balance = self.settings.min_portfolio_balance
+                    
+                    # Filter positions with balance > min_threshold, exclude USDT
+                    for position in portfolio.positions:
+                        if (
+                            position.coin.upper() != "USDT"
+                            and position.total_balance > min_balance
+                        ):
+                            include_symbols.append(position.coin)
+                    
+                    logger.info(
+                        "Portfolio coins for analysis",
+                        count=len(include_symbols),
+                        coins=include_symbols,
+                        min_balance=min_balance,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to fetch portfolio, continuing without portfolio coins",
+                        error=str(e),
+                    )
+            
+            analyses = await self.analyst.analyze_top_coins(
+                limit=self.top_coins_count,
+                include_symbols=include_symbols if include_symbols else None,
+            )
             result.coins_analyzed = len(analyses)
             
             logger.info("Analysis phase complete", analyzed=len(analyses))

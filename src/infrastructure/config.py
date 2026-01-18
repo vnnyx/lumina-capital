@@ -120,6 +120,16 @@ class Settings(BaseSettings):
         description="CoinGecko API key (optional, for higher rate limits)",
     )
     
+    # Portfolio Analysis Configuration
+    min_portfolio_balance: float = Field(
+        default=1.0,
+        description="Minimum balance (in coin units) to include portfolio coin in analysis",
+    )
+    include_portfolio_in_analysis: bool = Field(
+        default=True,
+        description="Include portfolio holdings in market analysis",
+    )
+    
     @property
     def is_live_trading(self) -> bool:
         """Check if live trading is enabled."""

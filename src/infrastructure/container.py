@@ -113,6 +113,8 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
     investment_cycle = InvestmentCycleUseCase(
         analyst_agent=analyst_agent,
         manager_agent=manager_agent,
+        trading_port=trading_adapter,
+        settings=settings,
         top_coins_count=settings.top_coins_count,
     )
     

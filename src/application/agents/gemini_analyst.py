@@ -379,20 +379,55 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
             logger.error("Analysis failed", symbol=symbol, error=str(e))
             return None
     
-    async def analyze_top_coins(self, limit: int = 200) -> list[CoinAnalysis]:
+    async def analyze_top_coins(
+        self,
+        limit: int = 200,
+        include_symbols: Optional[list[str]] = None,
+    ) -> list[CoinAnalysis]:
         """
-        Analyze top coins by volume.
+        Analyze top coins by volume plus additional symbols.
         
         Args:
             limit: Number of top coins to analyze
+            include_symbols: Additional symbols to include (e.g., portfolio holdings)
+                            These will be deduplicated against top coins.
             
         Returns:
             List of completed analyses.
         """
-        logger.info("Starting analysis of top coins", limit=limit)
+        logger.info(
+            "Starting analysis of top coins",
+            limit=limit,
+            additional_symbols=len(include_symbols) if include_symbols else 0,
+        )
         
         # Fetch top coins by volume
         top_tickers = await self.market_data.get_top_coins_by_volume(limit=limit)
+        
+        # Build set of symbols already in top coins for deduplication
+        top_symbols_set = {t.symbol for t in top_tickers}
+        
+        # Find additional symbols not already in top coins
+        additional_tickers: list[TickerData] = []
+        if include_symbols:
+            for symbol in include_symbols:
+                trading_symbol = f"{symbol}USDT" if not symbol.endswith("USDT") else symbol
+                if trading_symbol not in top_symbols_set:
+                    # Fetch ticker for this symbol
+                    try:
+                        ticker = await self.market_data.get_ticker(trading_symbol)
+                        if ticker:
+                            additional_tickers.append(ticker)
+                            logger.info(
+                                "Added portfolio coin to analysis",
+                                symbol=trading_symbol,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to fetch ticker for portfolio coin",
+                            symbol=trading_symbol,
+                            error=str(e),
+                        )
         
         # Fetch fundamental data once for all coins (if enabled)
         fundamental_data: Optional[FundamentalData] = None
@@ -423,7 +458,9 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
                 logger.warning("Failed to fetch fundamental data, continuing without it", error=str(e))
         
         analyses = []
+        total_coins = len(top_tickers) + len(additional_tickers)
         
+        # Analyze top coins by volume
         for rank, ticker in enumerate(top_tickers, start=1):
             # Extract coin ticker and get full name
             coin_ticker = ticker.symbol.replace("USDT", "")
@@ -441,9 +478,36 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
             
             # Log progress every 10 coins
             if rank % 10 == 0:
-                logger.info("Analysis progress", completed=rank, total=limit)
+                logger.info("Analysis progress", completed=rank, total=total_coins)
         
-        logger.info("Analysis complete", total_analyzed=len(analyses))
+        # Analyze additional portfolio coins (rank = limit + index)
+        for idx, ticker in enumerate(additional_tickers):
+            coin_ticker = ticker.symbol.replace("USDT", "")
+            coin_name = self.get_coin_name(coin_ticker)
+            rank = limit + idx + 1  # Rank after all top coins
+            
+            analysis = await self.analyze_coin(
+                symbol=ticker.symbol,
+                volume_rank=rank,
+                coin_name=coin_name,
+                fundamental_data=fundamental_data,
+            )
+            
+            if analysis:
+                analyses.append(analysis)
+            
+            logger.info(
+                "Analyzed portfolio coin",
+                symbol=ticker.symbol,
+                rank=rank,
+            )
+        
+        logger.info(
+            "Analysis complete",
+            total_analyzed=len(analyses),
+            top_coins=len(top_tickers),
+            portfolio_coins=len(additional_tickers),
+        )
         
         # Batch save all analyses
         await self.storage.batch_save_analyses(analyses)
