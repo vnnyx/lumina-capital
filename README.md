@@ -207,7 +207,3 @@ mypy src/
 # Format
 ruff format src/
 ```
-
-## License
-
-MIT License - See LICENSE file for details.
