@@ -20,8 +20,9 @@ src/
 ├── adapters/                  # External service implementations
 │   ├── bitget/                # Bitget API adapter
 │   ├── dynamodb/              # AWS DynamoDB adapter
+│   ├── fundamental/           # Fundamental data adapters (CoinGecko, Alternative.me)
 │   ├── llm/                   # LLM adapters (Gemini, DeepSeek)
-│   └── lambda_handler.py      # AWS Lambda entry point
+│   └── storage/               # JSON storage adapter
 └── infrastructure/            # Configuration and logging
     ├── config.py              # Settings management
     ├── container.py           # Dependency injection
@@ -32,38 +33,44 @@ src/
 
 ### Gemini Analyst Agent
 - **Role**: Market Data Analyst
-- **Model**: Google Gemini 2.0 Flash
-- **Task**: Analyzes top 200 cryptocurrencies by volume, identifies trends, volatility, and trading opportunities
-- **Output**: Structured market analysis stored in DynamoDB
+- **Model**: Google Gemini 2.0 Flash / Gemini 3 Pro
+- **Task**: Analyzes top N cryptocurrencies by volume + portfolio holdings
+- **Features**:
+  - Technical analysis (trends, volatility, support/resistance)
+  - Fundamental data integration (Fear & Greed Index, CoinGecko metrics)
+  - Auto-retry with exponential backoff on API errors (503, 429, etc.)
+- **Output**: Structured market analysis stored in JSON/DynamoDB
 
 ### DeepSeek Manager Agent
 - **Role**: Autonomous Portfolio Manager
 - **Model**: DeepSeek R1 (Reasoner)
 - **Task**: Makes buy/sell/hold decisions with full autonomy over risk management
-- **Input**: Gemini analyses + current portfolio state
+- **Input**: Gemini analyses + current portfolio state (filtered by min balance)
 - **Output**: Trading decisions with reasoning
 
 ## Features
 
 - **Multi-Agent System**: Gemini for analysis, DeepSeek for decisions
 - **Hexagonal Architecture**: Easy to swap adapters (exchange, storage, LLM)
+- **Fundamental Analysis**: Fear & Greed Index + CoinGecko metrics with caching
+- **Auto-Lookup**: Unknown tickers automatically discovered via CoinGecko search
+- **Portfolio Integration**: Analyze both top N coins AND current holdings
+- **Configurable Filtering**: Min balance threshold for portfolio positions
 - **Paper Trading**: Safe testing mode (default)
 - **Live Trading**: Execute real trades on Bitget
-- **AWS Lambda Ready**: Scheduled execution via CloudWatch Events
-- **Local Development**: Docker Compose with DynamoDB Local
-- **DynamoDB Storage**: Persistent coin analysis with key format `TICKER-COINNAME`
+- **Flexible Storage**: JSON (local) or DynamoDB (production)
+- **Auto-Retry**: Exponential backoff on transient API errors
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.13.7
-- Docker & Docker Compose
-- AWS account (for production)
+- Python 3.13+
 - API keys for:
   - Bitget
   - Google Gemini
   - DeepSeek
+  - CoinGecko (optional, for higher rate limits)
 
 ### Local Development
 
@@ -74,17 +81,12 @@ src/
    # Edit .env with your API keys
    ```
 
-2. **Start local DynamoDB**:
-   ```bash
-   docker-compose up -d dynamodb-local dynamodb-admin
-   ```
-
-3. **Install dependencies**:
+2. **Install dependencies**:
    ```bash
    pip install -e ".[dev]"
    ```
 
-4. **Run investment cycle**:
+3. **Run investment cycle**:
    ```bash
    # Full cycle (analysis + decisions) in dry-run mode
    python -m src.main
@@ -113,25 +115,6 @@ docker-compose run lumina-capital --mode full --dry-run
 docker-compose run lumina-capital --mode analyze-only
 ```
 
-### AWS Lambda Deployment
-
-1. **Build Lambda image**:
-   ```bash
-   docker build -f Dockerfile.lambda -t lumina-capital:latest .
-   ```
-
-2. **Push to ECR**:
-   ```bash
-   aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
-   docker tag lumina-capital:latest $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/lumina-capital:latest
-   docker push $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com/lumina-capital:latest
-   ```
-
-3. **Deploy with SAM**:
-   ```bash
-   sam deploy --guided
-   ```
-
 ## Configuration
 
 ### Environment Variables
@@ -147,32 +130,56 @@ docker-compose run lumina-capital --mode analyze-only
 | `DEEPSEEK_MODEL` | DeepSeek model name | `deepseek-reasoner` |
 | `TRADE_MODE` | `paper` or `live` | `paper` |
 | `TOP_COINS_COUNT` | Coins to analyze | `200` |
-| `USE_LOCAL_DYNAMODB` | Use local DynamoDB | `true` |
+| `STORAGE_TYPE` | `json` or `dynamodb` | `json` |
+| `JSON_STORAGE_PATH` | Path to JSON storage file | `data/coin_analyses.json` |
+| `ENABLE_FUNDAMENTAL_ANALYSIS` | Enable Fear & Greed + CoinGecko | `true` |
+| `FUNDAMENTAL_CACHE_PATH` | Path to fundamental data cache | `data/fundamental_cache.json` |
+| `COINGECKO_API_KEY` | CoinGecko API key (optional) | - |
+| `MIN_PORTFOLIO_BALANCE` | Min balance to include position | `1.0` |
+| `INCLUDE_PORTFOLIO_IN_ANALYSIS` | Analyze portfolio holdings | `true` |
 
 ## Investment Cycle Workflow
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Bitget API    │────▶│  Gemini Agent   │────▶│    DynamoDB     │
-│  (Market Data)  │     │   (Analyst)     │     │  (Storage)      │
+│   Bitget API    │────▶│  Gemini Agent   │────▶│  JSON/DynamoDB  │
+│  (Market Data)  │     │   (Analyst)     │     │    (Storage)    │
 └─────────────────┘     └─────────────────┘     └────────┬────────┘
-                                                         │
-                        ┌─────────────────┐              │
-                        │  DeepSeek Agent │◀─────────────┘
-                        │   (Manager)     │
-                        └────────┬────────┘
-                                 │
+        │                       │                        │
+        │               ┌───────▼───────┐                │
+        │               │  Fundamental  │                │
+        │               │  Data Service │                │
+        │               │ (CoinGecko +  │                │
+        │               │ Fear & Greed) │                │
+        │               └───────────────┘                │
+        │                                                │
+        │               ┌─────────────────┐              │
+        │               │  DeepSeek Agent │◀─────────────┘
+        │               │   (Manager)     │
+        │               └────────┬────────┘
+        │                        │
+        └───────────────────────▶│
                         ┌────────▼────────┐
                         │   Bitget API    │
                         │ (Trade Exec)    │
                         └─────────────────┘
 ```
 
-1. **Fetch Market Data**: Get top 200 coins by USDT volume from Bitget
-2. **Analyze**: Gemini analyzes each coin's price action, trends, volatility
-3. **Store**: Save analyses to DynamoDB with key `TICKER-COINNAME`
-4. **Decide**: DeepSeek reviews all analyses + portfolio, generates decisions
-5. **Execute**: Execute trades (paper mode logs, live mode places orders)
+### Analysis Phase
+1. **Fetch Portfolio**: Get current holdings from Bitget
+2. **Filter Portfolio**: Include coins with balance > `MIN_PORTFOLIO_BALANCE`
+3. **Fetch Top Coins**: Get top N coins by USDT volume
+4. **Deduplicate**: Merge portfolio + top coins (no duplicates)
+5. **Fetch Fundamental Data**: Fear & Greed Index + CoinGecko metrics (with caching)
+6. **Auto-Lookup**: Unknown tickers discovered via CoinGecko search API
+7. **Analyze**: Gemini analyzes each coin (technical + fundamental)
+8. **Store**: Save analyses to JSON/DynamoDB
+
+### Decision Phase
+1. **Load Analyses**: Retrieve all stored coin analyses
+2. **Fetch Portfolio**: Get current holdings (filtered by min balance)
+3. **Generate Decisions**: DeepSeek R1 reviews data and generates trades
+4. **Execute**: Execute trades (paper mode logs, live mode places orders)
 
 ## Security Considerations
 
