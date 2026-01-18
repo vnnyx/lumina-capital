@@ -12,6 +12,7 @@ from src.domain.entities.trade_decision import TradeAction, TradeDecision
 from src.domain.ports.llm_port import LLMMessage, LLMPort
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.trading_port import TradingPort
+from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -121,6 +122,7 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         llm: LLMPort,
         storage_port: StoragePort,
         trading_port: TradingPort,
+        settings: Settings,
     ):
         """
         Initialize the DeepSeek manager agent.
@@ -129,10 +131,12 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
             llm: LLM adapter (DeepSeek R1)
             storage_port: Storage for retrieving analyses and storing decisions
             trading_port: Trading interface for execution
+            settings: Application settings
         """
         self.llm = llm
         self.storage = storage_port
         self.trading = trading_port
+        self.settings = settings
     
     def _format_analyses_summary(self, analyses: list[CoinAnalysis]) -> str:
         """Format analyses into a summary for the manager."""
@@ -164,14 +168,18 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
     
     def _format_portfolio_summary(self, portfolio: Portfolio) -> str:
         """Format portfolio into a summary for the manager."""
+        min_balance = self.settings.min_portfolio_balance
+        
         summary = {
             "available_usdt": portfolio.usdt_balance,
             "total_positions": portfolio.total_positions,
+            "min_balance_filter": min_balance,
             "positions": [],
         }
         
         for position in portfolio.positions:
-            if position.total_balance > 0:
+            # Filter out dust positions below minimum balance threshold
+            if position.total_balance > min_balance and position.coin.upper() != "USDT":
                 summary["positions"].append({
                     "coin": position.coin,
                     "available": position.available,

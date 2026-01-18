@@ -107,6 +107,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         llm=deepseek_adapter,
         storage_port=storage_adapter,
         trading_port=trading_adapter,
+        settings=settings,
     )
     
     # Create use cases
