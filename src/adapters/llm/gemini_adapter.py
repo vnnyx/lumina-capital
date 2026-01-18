@@ -2,6 +2,7 @@
 Gemini LLM Adapter - Implements LLMPort for Google Gemini.
 """
 
+import asyncio
 import json
 from typing import Any, Optional
 
@@ -13,6 +14,11 @@ from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Retry configuration
+MAX_RETRIES = 3
+BASE_RETRY_DELAY = 2.0  # seconds
+RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504]
 
 
 class GeminiAdapter(LLMPort):
@@ -41,6 +47,49 @@ class GeminiAdapter(LLMPort):
     def model_name(self) -> str:
         """Get the model name being used."""
         return self._model_name
+    
+    def _is_retryable_error(self, error: Exception) -> bool:
+        """Check if an error is retryable."""
+        error_str = str(error).lower()
+        # Check for common retryable status codes in error message
+        if any(str(code) in error_str for code in RETRYABLE_STATUS_CODES):
+            return True
+        # Check for common retryable keywords
+        retryable_keywords = ["overloaded", "unavailable", "rate limit", "too many requests", "timeout"]
+        return any(keyword in error_str for keyword in retryable_keywords)
+    
+    async def _generate_with_retry(
+        self,
+        contents: list,
+        config: types.GenerateContentConfig,
+    ) -> Any:
+        """Generate content with retry logic for transient errors."""
+        last_error = None
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=self._model_name,
+                    contents=contents,
+                    config=config,
+                )
+                return response
+            except Exception as e:
+                last_error = e
+                if self._is_retryable_error(e) and attempt < MAX_RETRIES - 1:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    logger.warning(
+                        "Gemini API error, retrying",
+                        attempt=attempt + 1,
+                        max_retries=MAX_RETRIES,
+                        delay=delay,
+                        error=str(e),
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        
+        raise last_error  # Should not reach here, but just in case
     
     async def generate(
         self,
@@ -79,9 +128,8 @@ class GeminiAdapter(LLMPort):
                 response_mime_type="application/json",
             )
         
-        # Generate response
-        response = await self._client.aio.models.generate_content(
-            model=self._model_name,
+        # Generate response with retry logic
+        response = await self._generate_with_retry(
             contents=contents,
             config=config,
         )

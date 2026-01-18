@@ -70,6 +70,9 @@ TICKER_TO_COINGECKO_ID = {
     "BGB": "bitget-token",
 }
 
+# Cache for dynamically discovered ticker mappings
+_dynamic_ticker_cache: dict[str, Optional[str]] = {}
+
 
 class CoinGeckoAdapter:
     """
@@ -115,8 +118,58 @@ class CoinGeckoAdapter:
             self._client = None
     
     def _ticker_to_id(self, ticker: str) -> Optional[str]:
-        """Convert ticker to CoinGecko ID."""
+        """Convert ticker to CoinGecko ID (from static mapping only)."""
         return TICKER_TO_COINGECKO_ID.get(ticker.upper())
+    
+    async def _search_ticker(self, ticker: str) -> Optional[str]:
+        """
+        Search for a ticker on CoinGecko and return its ID.
+        
+        Uses the /search endpoint to find coins by symbol.
+        Results are cached to avoid repeated API calls.
+        
+        Args:
+            ticker: Coin ticker symbol (e.g., "RIVER")
+            
+        Returns:
+            CoinGecko ID if found, None otherwise.
+        """
+        ticker_upper = ticker.upper()
+        
+        # Check dynamic cache first
+        if ticker_upper in _dynamic_ticker_cache:
+            return _dynamic_ticker_cache[ticker_upper]
+        
+        try:
+            client = await self._get_client()
+            response = await client.get(
+                f"{self.BASE_URL}/search",
+                params={"query": ticker},
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            coins = data.get("coins", [])
+            
+            # Find exact symbol match (case-insensitive)
+            for coin in coins:
+                if coin.get("symbol", "").upper() == ticker_upper:
+                    cg_id = coin.get("id")
+                    _dynamic_ticker_cache[ticker_upper] = cg_id
+                    logger.info(
+                        f"Discovered CoinGecko ID for ticker: {ticker_upper} -> {cg_id}"
+                    )
+                    return cg_id
+            
+            # No match found, cache as None to avoid repeated searches
+            _dynamic_ticker_cache[ticker_upper] = None
+            logger.debug(f"No CoinGecko match found for ticker: {ticker}")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"Failed to search CoinGecko for ticker {ticker}: {e}")
+            # Don't cache failures to allow retry
+            return None
     
     async def get_coin_metrics(self, tickers: list[str]) -> dict[str, CoinMetrics]:
         """
@@ -132,12 +185,23 @@ class CoinGeckoAdapter:
         
         # Convert tickers to CoinGecko IDs
         ticker_to_id = {}
+        unknown_tickers = []
+        
         for ticker in tickers:
+            # First check static mapping
             cg_id = self._ticker_to_id(ticker)
             if cg_id:
                 ticker_to_id[ticker.upper()] = cg_id
             else:
-                logger.warning(f"Unknown ticker for CoinGecko: {ticker}")
+                unknown_tickers.append(ticker)
+        
+        # Auto-lookup unknown tickers via search API
+        if unknown_tickers:
+            logger.info(f"Looking up {len(unknown_tickers)} unknown tickers on CoinGecko")
+            for ticker in unknown_tickers:
+                cg_id = await self._search_ticker(ticker)
+                if cg_id:
+                    ticker_to_id[ticker.upper()] = cg_id
         
         if not ticker_to_id:
             return results
