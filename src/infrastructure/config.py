@@ -106,6 +106,20 @@ class Settings(BaseSettings):
         description="Logging level",
     )
     
+    # Fundamental Analysis Configuration
+    enable_fundamental_analysis: bool = Field(
+        default=True,
+        description="Enable fundamental data fetching (Fear & Greed, CoinGecko)",
+    )
+    fundamental_cache_path: str = Field(
+        default="data/fundamental_cache.json",
+        description="Path to fundamental data cache file",
+    )
+    coingecko_api_key: Optional[str] = Field(
+        default=None,
+        description="CoinGecko API key (optional, for higher rate limits)",
+    )
+    
     @property
     def is_live_trading(self) -> bool:
         """Check if live trading is enabled."""

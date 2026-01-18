@@ -7,7 +7,9 @@ from datetime import datetime
 from typing import Optional
 
 from src.domain.entities.coin_analysis import CoinAnalysis, GeminiInsight
+from src.domain.entities.fundamental_data import FundamentalData
 from src.domain.entities.market_data import MarketData, TickerData
+from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.domain.ports.llm_port import LLMMessage, LLMPort
 from src.domain.ports.market_data_port import MarketDataPort
 from src.domain.ports.storage_port import StoragePort
@@ -89,29 +91,38 @@ class GeminiAnalystAgent:
         """Get full coin name from ticker symbol."""
         return cls.COIN_NAMES.get(ticker.upper(), ticker)
     
-    SYSTEM_PROMPT = """You are an expert cryptocurrency market analyst with deep knowledge of technical analysis, market microstructure, and crypto trading patterns.
+    SYSTEM_PROMPT = """You are an expert cryptocurrency market analyst with deep knowledge of technical analysis, fundamental analysis, market microstructure, and crypto trading patterns.
 
 ## Your Persona
 - Name: Market Analyst Alpha
-- Expertise: Technical analysis, volume analysis, price action, market sentiment
+- Expertise: Technical analysis, fundamental analysis, volume analysis, price action, market sentiment
 - Approach: Data-driven, objective, thorough
 
 ## Your Context
 You are part of an automated investment management system. Your role is to analyze market data and provide structured insights that will be used by a portfolio manager AI to make trading decisions.
 
 ## Your Task
-Analyze the provided market data for a cryptocurrency and produce a comprehensive technical analysis. Focus on:
+Analyze the provided market data and fundamental data for a cryptocurrency and produce a comprehensive analysis. Focus on:
 
+### Technical Analysis
 1. **Price Trend**: Identify the current trend (bullish/bearish/sideways) based on recent price action
 2. **Momentum**: Assess the strength of the current move (strong/moderate/weak)
 3. **Volatility**: Calculate and interpret price volatility
 4. **Volume Analysis**: Analyze trading volume patterns and their implications
 5. **Support/Resistance**: Identify key price levels
-6. **Risk Factors**: Note any concerning patterns or risks
-7. **Opportunity Factors**: Highlight potential opportunities
+
+### Fundamental Analysis (when data provided)
+6. **Market Sentiment**: Consider Fear & Greed Index implications
+7. **Market Position**: Evaluate market cap rank and relative valuation
+8. **Supply Dynamics**: Consider circulating supply vs max supply
+9. **Price Context**: How far from ATH/ATL, 7d/30d performance
+
+### Synthesis
+10. **Risk Factors**: Note any concerning patterns or risks (technical AND fundamental)
+11. **Opportunity Factors**: Highlight potential opportunities
 
 ## Output Requirements
-You MUST respond with valid JSON matching the exact schema provided. Be specific and quantitative where possible. Base all conclusions on the data provided.
+You MUST respond with valid JSON matching the exact schema provided. Be specific and quantitative where possible. Base all conclusions on the data provided. When fundamental data is available, integrate it into your analysis.
 """
     
     OUTPUT_SCHEMA = {
@@ -179,6 +190,7 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
         llm: LLMPort,
         market_data_port: MarketDataPort,
         storage_port: StoragePort,
+        fundamental_data_port: Optional[FundamentalDataPort] = None,
     ):
         """
         Initialize the Gemini analyst agent.
@@ -187,14 +199,23 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
             llm: LLM adapter (Gemini)
             market_data_port: Market data source
             storage_port: Storage for analysis results
+            fundamental_data_port: Optional fundamental data source
         """
         self.llm = llm
         self.market_data = market_data_port
         self.storage = storage_port
+        self.fundamental_data = fundamental_data_port
+        self._cached_fundamental_data: Optional[FundamentalData] = None
     
-    def _format_market_data_prompt(self, market_data: MarketData, rank: int) -> str:
-        """Format market data into a prompt for analysis."""
+    def _format_market_data_prompt(
+        self,
+        market_data: MarketData,
+        rank: int,
+        fundamental_data: Optional[FundamentalData] = None,
+    ) -> str:
+        """Format market data and fundamental data into a prompt for analysis."""
         ticker = market_data.ticker
+        coin_ticker = ticker.symbol.replace("USDT", "")
         
         # Format candle data
         candle_summary = []
@@ -229,8 +250,15 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
 ### Calculated Metrics
 - **Simple Trend**: {market_data.price_trend}
 - **Volatility (CV)**: {market_data.volatility:.4f}
-
-Please analyze this data and provide your insights."""
+"""
+        
+        # Add fundamental data section if available
+        if fundamental_data:
+            fundamental_section = fundamental_data.get_summary_for_prompt(coin_ticker)
+            if fundamental_section:
+                prompt += f"\n{fundamental_section}\n"
+        
+        prompt += "\nPlease analyze this data and provide your insights."
         
         return prompt
     
@@ -239,6 +267,7 @@ Please analyze this data and provide your insights."""
         symbol: str,
         volume_rank: int,
         coin_name: Optional[str] = None,
+        fundamental_data: Optional[FundamentalData] = None,
     ) -> Optional[CoinAnalysis]:
         """
         Analyze a single coin and store the results.
@@ -247,6 +276,7 @@ Please analyze this data and provide your insights."""
             symbol: Trading pair symbol (e.g., BTCUSDT)
             volume_rank: Rank by volume (1 = highest)
             coin_name: Full coin name
+            fundamental_data: Optional pre-fetched fundamental data
             
         Returns:
             CoinAnalysis with Gemini insights or None on failure.
@@ -269,8 +299,11 @@ Please analyze this data and provide your insights."""
         if coin_name is None:
             coin_name = self.get_coin_name(ticker)
         
+        # Use passed fundamental data or cached data
+        fund_data = fundamental_data or self._cached_fundamental_data
+        
         # Generate analysis prompt
-        user_prompt = self._format_market_data_prompt(market_data, volume_rank)
+        user_prompt = self._format_market_data_prompt(market_data, volume_rank, fund_data)
         
         # Get Gemini analysis
         try:
@@ -361,6 +394,34 @@ Please analyze this data and provide your insights."""
         # Fetch top coins by volume
         top_tickers = await self.market_data.get_top_coins_by_volume(limit=limit)
         
+        # Fetch fundamental data once for all coins (if enabled)
+        fundamental_data: Optional[FundamentalData] = None
+        if self.fundamental_data:
+            try:
+                # Get tickers for fundamental data fetch
+                tickers_for_fundamentals = [
+                    t.symbol.replace("USDT", "") for t in top_tickers[:20]
+                ]
+                logger.info("Fetching fundamental data", tickers=len(tickers_for_fundamentals))
+                fundamental_data = await self.fundamental_data.get_all_fundamental_data(
+                    tickers=tickers_for_fundamentals
+                )
+                # Cache for individual coin analyses
+                self._cached_fundamental_data = fundamental_data
+                
+                if fundamental_data.fear_greed:
+                    logger.info(
+                        "Fear & Greed Index fetched",
+                        value=fundamental_data.fear_greed.value,
+                        label=fundamental_data.fear_greed.label,
+                    )
+                logger.info(
+                    "Coin metrics fetched",
+                    count=len(fundamental_data.coin_metrics),
+                )
+            except Exception as e:
+                logger.warning("Failed to fetch fundamental data, continuing without it", error=str(e))
+        
         analyses = []
         
         for rank, ticker in enumerate(top_tickers, start=1):
@@ -372,6 +433,7 @@ Please analyze this data and provide your insights."""
                 symbol=ticker.symbol,
                 volume_rank=rank,
                 coin_name=coin_name,
+                fundamental_data=fundamental_data,
             )
             
             if analysis:
