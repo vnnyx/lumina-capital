@@ -1,0 +1,3 @@
+"""
+Adapters - External service implementations.
+"""
