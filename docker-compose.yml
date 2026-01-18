@@ -1,0 +1,54 @@
+services:
+  # Local DynamoDB for development
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: lumina-dynamodb
+    ports:
+      - "8000:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /data"
+    volumes:
+      - dynamodb-data:/data
+    networks:
+      - lumina-network
+
+  # Main application (for local development/testing)
+  lumina-capital:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumina-capital
+    env_file:
+      - .env
+    environment:
+      - USE_LOCAL_DYNAMODB=true
+      - DYNAMODB_ENDPOINT_URL=http://dynamodb-local:8000
+      - LOG_LEVEL=INFO
+    depends_on:
+      - dynamodb-local
+    networks:
+      - lumina-network
+    # Override command for different modes
+    # command: ["--mode", "full", "--dry-run"]
+
+  # DynamoDB Admin UI (optional, for debugging)
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin:latest
+    container_name: lumina-dynamodb-admin
+    ports:
+      - "8001:8001"
+    environment:
+      - DYNAMO_ENDPOINT=http://dynamodb-local:8000
+      - AWS_REGION=ap-southeast-1
+      - AWS_ACCESS_KEY_ID=local
+      - AWS_SECRET_ACCESS_KEY=local
+    depends_on:
+      - dynamodb-local
+    networks:
+      - lumina-network
+
+volumes:
+  dynamodb-data:
+
+networks:
+  lumina-network:
+    driver: bridge
