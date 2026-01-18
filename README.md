@@ -144,14 +144,15 @@ docker-compose run lumina-capital --mode analyze-only
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │   Bitget API    │────▶│  Gemini Agent   │────▶│  JSON/DynamoDB  │
 │  (Market Data)  │     │   (Analyst)     │     │    (Storage)    │
-└─────────────────┘     └─────────────────┘     └────────┬────────┘
-        │                       │                        │
-        │               ┌───────▼───────┐                │
-        │               │  Fundamental  │                │
-        │               │  Data Service │                │
-        │               │ (CoinGecko +  │                │
-        │               │ Fear & Greed) │                │
-        │               └───────────────┘                │
+└─────────────────┘     └────────┬────────┘     └────────┬────────┘
+        │                        │                       │
+        │                        │                       │
+        │               ┌────────▼────────┐              │
+        │               │  Fundamental    │              │
+        │               │  Data Service   │              │
+        │               │ (CoinGecko +    │              │
+        │               │  Fear & Greed)  │              │
+        │               └─────────────────┘              │
         │                                                │
         │               ┌─────────────────┐              │
         │               │  DeepSeek Agent │◀─────────────┘
