@@ -3,7 +3,7 @@ Bitget Trading Adapter - Implements TradingPort.
 """
 
 import uuid
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from src.adapters.bitget.client import BitgetClient, BitgetAPIError
 from src.domain.entities.portfolio import Portfolio, PortfolioPosition
@@ -16,6 +16,10 @@ from src.domain.ports.trading_port import TradingPort
 from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
 
+if TYPE_CHECKING:
+    from src.adapters.bitget.trade_fills_cache import TradeFillsCache
+    from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
+
 logger = get_logger(__name__)
 
 
@@ -27,28 +31,42 @@ class BitgetTradingAdapter(TradingPort):
     Supports paper trading mode for simulation.
     """
     
-    def __init__(self, client: BitgetClient, settings: Settings):
+    def __init__(
+        self,
+        client: BitgetClient,
+        settings: Settings,
+        trade_fills_cache: Optional["TradeFillsCache"] = None,
+        paper_trades_tracker: Optional["PaperTradesTracker"] = None,
+    ):
         """
         Initialize adapter.
         
         Args:
             client: Bitget HTTP client
             settings: Application settings
+            trade_fills_cache: Optional cache for trade fills (live mode PNL)
+            paper_trades_tracker: Optional tracker for paper trades (paper mode PNL)
         """
         self.client = client
         self.settings = settings
         self.paper_mode = settings.trade_mode == "paper"
+        self.trade_fills_cache = trade_fills_cache
+        self.paper_trades_tracker = paper_trades_tracker
         
         # Paper trading state
         self._paper_portfolio: dict[str, PortfolioPosition] = {}
         self._paper_orders: list[dict] = []
     
     async def get_portfolio(self) -> Portfolio:
-        """Fetch current portfolio holdings."""
+        """Fetch current portfolio holdings with PNL enrichment."""
         logger.info("Fetching portfolio", paper_mode=self.paper_mode)
         
         if self.paper_mode and self._paper_portfolio:
-            return Portfolio(positions=list(self._paper_portfolio.values()))
+            positions = list(self._paper_portfolio.values())
+            portfolio = Portfolio(positions=positions)
+            # Enrich with PNL data for paper mode
+            await self._enrich_portfolio_pnl(portfolio)
+            return portfolio
         
         data = await self.client.get(
             "/api/v2/spot/account/assets",
@@ -68,6 +86,9 @@ class BitgetTradingAdapter(TradingPort):
         ]
         
         portfolio = Portfolio(positions=positions)
+        
+        # Enrich with PNL data
+        await self._enrich_portfolio_pnl(portfolio)
         
         logger.info(
             "Portfolio fetched",
@@ -93,6 +114,116 @@ class BitgetTradingAdapter(TradingPort):
         item = data[0] if isinstance(data, list) else data
         return item.get("available", "0")
     
+    async def _get_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get current market price for a symbol.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            
+        Returns:
+            Current price as float or None.
+        """
+        try:
+            data = await self.client.get(
+                "/api/v2/spot/market/tickers",
+                params={"symbol": symbol.upper()},
+                authenticated=False,
+            )
+            if data and isinstance(data, list) and len(data) > 0:
+                return float(data[0].get("lastPr", 0))
+            return None
+        except Exception as e:
+            logger.warning("Failed to get price", symbol=symbol, error=str(e))
+            return None
+    
+    async def _enrich_portfolio_pnl(self, portfolio: Portfolio) -> None:
+        """
+        Enrich portfolio positions with PNL data.
+        
+        For live mode: Uses TradeFillsCache to get cost basis from trade history.
+        For paper mode: Uses PaperTradesTracker to get entry prices.
+        
+        Args:
+            portfolio: Portfolio to enrich (modified in place)
+        """
+        # Get coins to enrich (exclude USDT and dust)
+        coins_to_enrich = [
+            p.coin for p in portfolio.positions
+            if p.coin.upper() != "USDT" and p.total_balance > self.settings.min_portfolio_balance
+        ]
+        
+        if not coins_to_enrich:
+            return
+        
+        logger.debug("Enriching PNL for coins", coins=coins_to_enrich)
+        
+        # Fetch current prices for all coins
+        prices: dict[str, float] = {}
+        for coin in coins_to_enrich:
+            symbol = f"{coin}USDT"
+            price = await self._get_current_price(symbol)
+            if price:
+                prices[coin.upper()] = price
+        
+        # Get cost basis based on mode
+        cost_basis: dict[str, float] = {}
+        
+        if self.paper_mode and self.paper_trades_tracker:
+            # Paper mode: get entry prices from paper trades tracker
+            for coin in coins_to_enrich:
+                entry_price = self.paper_trades_tracker.get_cost_basis(coin)
+                if entry_price:
+                    cost_basis[coin.upper()] = entry_price
+        elif not self.paper_mode and self.trade_fills_cache:
+            # Live mode: get cost basis from trade fills cache
+            try:
+                cb_results = await self.trade_fills_cache.get_cost_basis_batch(coins_to_enrich)
+                for coin, cb in cb_results.items():
+                    cost_basis[coin.upper()] = cb.avg_entry_price
+            except Exception as e:
+                logger.warning("Failed to get cost basis", error=str(e))
+        
+        # Enrich each position
+        for position in portfolio.positions:
+            coin_upper = position.coin.upper()
+            
+            if coin_upper == "USDT":
+                continue
+            
+            # Set current price
+            if coin_upper in prices:
+                position.current_price = prices[coin_upper]
+            
+            # Set entry price and calculate PNL
+            if coin_upper in cost_basis:
+                position.avg_entry_price = cost_basis[coin_upper]
+                
+                if position.current_price and position.avg_entry_price:
+                    qty = position.total_balance
+                    entry = position.avg_entry_price
+                    current = position.current_price
+                    
+                    position.unrealized_pnl = (current - entry) * qty
+                    position.unrealized_pnl_pct = ((current - entry) / entry) * 100 if entry > 0 else 0.0
+            else:
+                # No cost basis available - set PNL to 0 as fallback
+                if position.current_price:
+                    position.unrealized_pnl = 0.0
+                    position.unrealized_pnl_pct = 0.0
+        
+        # Log summary
+        total_pnl = sum(
+            p.unrealized_pnl or 0 
+            for p in portfolio.positions 
+            if p.unrealized_pnl is not None
+        )
+        logger.info(
+            "Portfolio PNL enriched",
+            positions_with_pnl=len([p for p in portfolio.positions if p.unrealized_pnl is not None]),
+            total_unrealized_pnl=round(total_pnl, 2),
+        )
+
     async def place_order(
         self,
         symbol: str,
@@ -269,6 +400,12 @@ class BitgetTradingAdapter(TradingPort):
         # Simulate immediate fill for market orders
         status = "filled" if order_type == "market" else "live"
         
+        # Determine execution price (for market orders, fetch current price)
+        exec_price = float(price) if price else 0.0
+        if order_type == "market" and not price:
+            current_price = await self._get_current_price(symbol)
+            exec_price = current_price if current_price else 0.0
+        
         paper_order = {
             "orderId": order_id,
             "clientOid": client_oid,
@@ -276,11 +413,22 @@ class BitgetTradingAdapter(TradingPort):
             "side": side,
             "orderType": order_type,
             "size": size,
-            "price": price or "0",
+            "price": str(exec_price),
             "status": status,
         }
         
         self._paper_orders.append(paper_order)
+        
+        # Record trade in paper trades tracker for PNL tracking
+        if status == "filled" and self.paper_trades_tracker and exec_price > 0:
+            # Extract coin from symbol (e.g., "BTCUSDT" -> "BTC")
+            coin = symbol.upper().replace("USDT", "")
+            quantity = float(size)
+            
+            if side.lower() == "buy":
+                self.paper_trades_tracker.record_buy(coin, quantity, exec_price)
+            elif side.lower() == "sell":
+                self.paper_trades_tracker.record_sell(coin, quantity, exec_price)
         
         logger.info("Paper order placed", order=paper_order)
         

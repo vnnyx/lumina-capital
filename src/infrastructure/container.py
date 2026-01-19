@@ -8,11 +8,13 @@ from typing import Optional
 from src.adapters.bitget.client import BitgetClient
 from src.adapters.bitget.market_data_adapter import BitgetMarketDataAdapter
 from src.adapters.bitget.trading_adapter import BitgetTradingAdapter
+from src.adapters.bitget.trade_fills_cache import TradeFillsCache
 from src.adapters.dynamodb.repository import DynamoDBStorageAdapter
 from src.adapters.fundamental.fundamental_data_service import FundamentalDataService
 from src.adapters.llm.deepseek_adapter import DeepSeekAdapter
 from src.adapters.llm.gemini_adapter import GeminiAdapter
 from src.adapters.storage.json_storage_adapter import JSONStorageAdapter
+from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
@@ -72,9 +74,31 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
     # Create Bitget client
     bitget_client = BitgetClient(settings)
     
+    # Create PNL tracking services
+    trade_fills_cache: Optional[TradeFillsCache] = None
+    paper_trades_tracker: Optional[PaperTradesTracker] = None
+    
+    if settings.trade_mode == "paper":
+        # Paper mode: use paper trades tracker
+        paper_trades_tracker = PaperTradesTracker(
+            storage_path=settings.paper_trades_path,
+        )
+    else:
+        # Live mode: use trade fills cache
+        trade_fills_cache = TradeFillsCache(
+            client=bitget_client,
+            cache_path=settings.trade_fills_cache_path,
+            cache_ttl_hours=settings.trade_fills_cache_ttl_hours,
+        )
+    
     # Create adapters
     market_data_adapter = BitgetMarketDataAdapter(bitget_client, settings)
-    trading_adapter = BitgetTradingAdapter(bitget_client, settings)
+    trading_adapter = BitgetTradingAdapter(
+        client=bitget_client,
+        settings=settings,
+        trade_fills_cache=trade_fills_cache,
+        paper_trades_tracker=paper_trades_tracker,
+    )
     gemini_adapter = GeminiAdapter(settings)
     deepseek_adapter = DeepSeekAdapter(settings)
     

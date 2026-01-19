@@ -130,6 +130,20 @@ class Settings(BaseSettings):
         description="Include portfolio holdings in market analysis",
     )
     
+    # PNL Tracking Configuration
+    trade_fills_cache_path: str = Field(
+        default="data/trade_fills_cache.json",
+        description="Path to trade fills cache file",
+    )
+    paper_trades_path: str = Field(
+        default="data/paper_trades.json",
+        description="Path to paper trades tracking file",
+    )
+    trade_fills_cache_ttl_hours: int = Field(
+        default=1,
+        description="Hours before trade fills cache is refreshed",
+    )
+    
     @property
     def is_live_trading(self) -> bool:
         """Check if live trading is enabled."""

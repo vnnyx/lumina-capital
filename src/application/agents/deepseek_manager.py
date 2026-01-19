@@ -53,14 +53,26 @@ There are NO hardcoded constraints on your decisions. You are trusted to manage 
 ## Your Context
 You receive:
 1. Market analysis data from our analyst agent (Gemini) for top 200 coins by volume
-2. Current portfolio holdings and available USDT balance
+2. Current portfolio holdings with PNL data:
+   - avg_entry_price: Your average cost basis for the position
+   - current_price: Current market price
+   - unrealized_pnl: Unrealized profit/loss in USDT
+   - unrealized_pnl_pct: Unrealized P&L as a percentage
 3. Recent trading decisions for context
 
+## Using PNL Data
+The portfolio includes unrealized PNL data for each position. Use this to:
+- Identify positions in profit that might be worth taking gains on
+- Identify losing positions that may need to be cut or averaged down
+- Make informed decisions about position sizing relative to your cost basis
+- Consider unrealized_pnl_pct to assess the magnitude of gains/losses
+- Note: If PNL shows 0%, it means we don't have historical cost basis data for that position
+
 ## Your Task
-1. Review all market analyses and current portfolio state
+1. Review all market analyses and current portfolio state (including PNL)
 2. Develop your investment thesis and risk management approach
 3. Make specific, actionable trading decisions
-4. Provide clear reasoning for each decision
+4. Provide clear reasoning for each decision, referencing PNL when relevant
 
 ## Decision Framework (suggestions, not requirements)
 - Consider correlation between assets
@@ -68,6 +80,7 @@ You receive:
 - Factor in volatility and liquidity
 - Consider portfolio concentration risk
 - Account for transaction costs
+- Use PNL data to inform profit-taking or loss-cutting decisions
 
 ## Output Requirements
 Return a JSON object with your decisions. Each decision should include:
@@ -167,7 +180,7 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         return json.dumps(summaries, indent=2)
     
     def _format_portfolio_summary(self, portfolio: Portfolio) -> str:
-        """Format portfolio into a summary for the manager."""
+        """Format portfolio into a summary for the manager with PNL data."""
         min_balance = self.settings.min_portfolio_balance
         
         summary = {
@@ -175,17 +188,38 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
             "total_positions": portfolio.total_positions,
             "min_balance_filter": min_balance,
             "positions": [],
+            "total_unrealized_pnl": 0.0,
         }
+        
+        total_pnl = 0.0
         
         for position in portfolio.positions:
             # Filter out dust positions below minimum balance threshold
             if position.total_balance > min_balance and position.coin.upper() != "USDT":
-                summary["positions"].append({
+                pos_data = {
                     "coin": position.coin,
                     "available": position.available,
                     "frozen": position.frozen,
                     "total": position.total_balance,
-                })
+                }
+                
+                # Add PNL data if available
+                if position.current_price is not None:
+                    pos_data["current_price"] = round(position.current_price, 6)
+                
+                if position.avg_entry_price is not None:
+                    pos_data["avg_entry_price"] = round(position.avg_entry_price, 6)
+                
+                if position.unrealized_pnl is not None:
+                    pos_data["unrealized_pnl"] = round(position.unrealized_pnl, 2)
+                    total_pnl += position.unrealized_pnl
+                
+                if position.unrealized_pnl_pct is not None:
+                    pos_data["unrealized_pnl_pct"] = round(position.unrealized_pnl_pct, 2)
+                
+                summary["positions"].append(pos_data)
+        
+        summary["total_unrealized_pnl"] = round(total_pnl, 2)
         
         return json.dumps(summary, indent=2)
     
