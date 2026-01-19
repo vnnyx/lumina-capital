@@ -18,7 +18,7 @@ from src.infrastructure.logging import get_logger
 
 if TYPE_CHECKING:
     from src.adapters.bitget.trade_fills_cache import TradeFillsCache
-    from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
+    from src.domain.ports.paper_trades_port import PaperTradesPort
 
 logger = get_logger(__name__)
 
@@ -36,7 +36,7 @@ class BitgetTradingAdapter(TradingPort):
         client: BitgetClient,
         settings: Settings,
         trade_fills_cache: Optional["TradeFillsCache"] = None,
-        paper_trades_tracker: Optional["PaperTradesTracker"] = None,
+        paper_trades_tracker: Optional["PaperTradesPort"] = None,
     ):
         """
         Initialize adapter.
@@ -172,7 +172,7 @@ class BitgetTradingAdapter(TradingPort):
         if self.paper_mode and self.paper_trades_tracker:
             # Paper mode: get entry prices from paper trades tracker
             for coin in coins_to_enrich:
-                entry_price = self.paper_trades_tracker.get_cost_basis(coin)
+                entry_price = await self.paper_trades_tracker.get_cost_basis(coin)
                 if entry_price:
                     cost_basis[coin.upper()] = entry_price
         elif not self.paper_mode and self.trade_fills_cache:
@@ -426,9 +426,9 @@ class BitgetTradingAdapter(TradingPort):
             quantity = float(size)
             
             if side.lower() == "buy":
-                self.paper_trades_tracker.record_buy(coin, quantity, exec_price)
+                await self.paper_trades_tracker.record_buy(coin, quantity, exec_price)
             elif side.lower() == "sell":
-                self.paper_trades_tracker.record_sell(coin, quantity, exec_price)
+                await self.paper_trades_tracker.record_sell(coin, quantity, exec_price)
         
         logger.info("Paper order placed", order=paper_order)
         

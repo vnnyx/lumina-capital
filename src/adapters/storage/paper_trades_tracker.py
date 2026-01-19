@@ -6,50 +6,17 @@ without actual trade execution on the exchange.
 """
 
 import json
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from src.domain.ports.paper_trades_port import PaperPosition, PaperTradesPort
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-@dataclass
-class PaperPosition:
-    """A paper trading position."""
-    
-    coin: str
-    quantity: float
-    avg_entry_price: float
-    total_cost: float
-    created_at: datetime
-    updated_at: datetime
-    
-    def to_dict(self) -> dict:
-        return {
-            "coin": self.coin,
-            "quantity": self.quantity,
-            "avg_entry_price": self.avg_entry_price,
-            "total_cost": self.total_cost,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-        }
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> "PaperPosition":
-        return cls(
-            coin=data["coin"],
-            quantity=data["quantity"],
-            avg_entry_price=data["avg_entry_price"],
-            total_cost=data["total_cost"],
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
-        )
-
-
-class PaperTradesTracker:
+class PaperTradesTracker(PaperTradesPort):
     """
     Tracks paper trading positions and calculates PNL.
     
@@ -116,7 +83,7 @@ class PaperTradesTracker:
         except Exception as e:
             logger.warning("Failed to save paper trades", error=str(e))
     
-    def record_buy(
+    async def record_buy(
         self,
         coin: str,
         quantity: float,
@@ -185,7 +152,7 @@ class PaperTradesTracker:
         
         return self._positions[coin]
     
-    def record_sell(
+    async def record_sell(
         self,
         coin: str,
         quantity: float,
@@ -254,22 +221,26 @@ class PaperTradesTracker:
         
         return result
     
-    def get_position(self, coin: str) -> Optional[PaperPosition]:
+    async def get_position(self, coin: str) -> Optional[PaperPosition]:
         """Get paper position for a coin."""
         return self._positions.get(coin.upper())
     
-    def get_all_positions(self) -> dict[str, PaperPosition]:
+    async def get_all_positions(self) -> dict[str, PaperPosition]:
         """Get all paper positions."""
         return self._positions.copy()
     
-    def get_cost_basis(self, coin: str) -> Optional[float]:
+    async def get_cost_basis(self, coin: str) -> Optional[float]:
         """Get average entry price for a coin."""
-        position = self.get_position(coin)
+        position = await self.get_position(coin)
         return position.avg_entry_price if position else None
     
-    def clear_all(self) -> None:
+    async def clear_all(self) -> None:
         """Clear all paper positions (for testing/reset)."""
         self._positions = {}
         self._trade_history = []
         self._save()
         logger.info("Paper trades cleared")
+    
+    async def get_trade_history(self, limit: int = 100) -> list[dict]:
+        """Get recent trade history."""
+        return self._trade_history[-limit:]

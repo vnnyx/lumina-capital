@@ -11,6 +11,7 @@ from src.adapters.bitget.trading_adapter import BitgetTradingAdapter
 from src.adapters.bitget.trade_fills_cache import TradeFillsCache
 from src.adapters.dynamodb.repository import DynamoDBStorageAdapter
 from src.adapters.dynamodb.analysis_history_repository import DynamoDBAnalysisHistoryAdapter
+from src.adapters.dynamodb.paper_trades_repository import DynamoDBPaperTradesAdapter
 from src.adapters.fundamental.fundamental_data_service import FundamentalDataService
 from src.adapters.llm.deepseek_adapter import DeepSeekAdapter
 from src.adapters.llm.gemini_adapter import GeminiAdapter
@@ -19,6 +20,7 @@ from src.adapters.storage.json_analysis_history import JsonAnalysisHistoryAdapte
 from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.analysis_history_port import AnalysisHistoryPort
+from src.domain.ports.paper_trades_port import PaperTradesPort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
 from src.application.agents.gemini_analyst import GeminiAnalystAgent
@@ -84,13 +86,17 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
     
     # Create PNL tracking services
     trade_fills_cache: Optional[TradeFillsCache] = None
-    paper_trades_tracker: Optional[PaperTradesTracker] = None
+    paper_trades_tracker: Optional[PaperTradesPort] = None
     
     if settings.trade_mode == "paper":
-        # Paper mode: use paper trades tracker
-        paper_trades_tracker = PaperTradesTracker(
-            storage_path=settings.paper_trades_path,
-        )
+        # Paper mode: use paper trades tracker (JSON or DynamoDB based on storage_type)
+        if settings.storage_type.lower() == "dynamodb":
+            paper_trades_tracker = DynamoDBPaperTradesAdapter(settings)
+            await paper_trades_tracker.initialize_table()
+        else:
+            paper_trades_tracker = PaperTradesTracker(
+                storage_path=settings.paper_trades_path,
+            )
     else:
         # Live mode: use trade fills cache
         trade_fills_cache = TradeFillsCache(
