@@ -132,6 +132,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         storage_port=storage_adapter,
         trading_port=trading_adapter,
         settings=settings,
+        market_data_port=market_data_adapter,
     )
     
     # Create use cases

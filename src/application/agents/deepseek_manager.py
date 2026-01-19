@@ -4,12 +4,14 @@ DeepSeek Manager Agent - Autonomous portfolio management using DeepSeek R1.
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from src.domain.entities.coin_analysis import CoinAnalysis
+from src.domain.entities.market_data import TickerData
 from src.domain.entities.portfolio import Portfolio
 from src.domain.entities.trade_decision import TradeAction, TradeDecision
 from src.domain.ports.llm_port import LLMMessage, LLMPort
+from src.domain.ports.market_data_port import MarketDataPort
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.trading_port import TradingPort
 from src.infrastructure.config import Settings
@@ -52,13 +54,34 @@ There are NO hardcoded constraints on your decisions. You are trusted to manage 
 
 ## Your Context
 You receive:
-1. Market analysis data from our analyst agent (Gemini) for top 200 coins by volume
+1. Market analysis data from our analyst agent (Gemini) for top coins by volume, including:
+   - analysis_price: Price when the analysis was performed
+   - change_24h_at_analysis: The 24-hour price change % when analysis was performed
+   - fresh_price: Current real-time price (fetched just now)
+   - fresh_change_24h: The current 24-hour price change % (fetched just now)
+   - price_change_since_analysis: How much the price moved since analysis
+   - analysis_age: How long ago the analysis was performed (e.g., "2.5 hours ago")
+   - trend, momentum, volatility: Qualitative insights from the analysis
 2. Current portfolio holdings with PNL data:
    - avg_entry_price: Your average cost basis for the position
    - current_price: Current market price
    - unrealized_pnl: Unrealized profit/loss in USDT
    - unrealized_pnl_pct: Unrealized P&L as a percentage
 3. Recent trading decisions for context
+
+## Using Price Data
+The analysis includes both the price at analysis time and the current fresh price. Use this to:
+- Identify if a coin has moved significantly since analysis (potential opportunity or warning)
+- Make decisions based on FRESH prices, not stale analysis prices
+- Consider if a bullish trend + price dip = buy opportunity
+- Consider if a bearish trend + price spike = sell opportunity
+- Note: If fresh_price is missing, the price fetch failed and analysis_price is shown instead
+
+## Using Momentum Shifts
+Compare change_24h_at_analysis with fresh_change_24h to detect momentum shifts:
+- If change_24h_at_analysis was +5% but fresh_change_24h is +2%, momentum is fading
+- If change_24h_at_analysis was -3% but fresh_change_24h is +1%, momentum has reversed bullish
+- Significant divergence between the two suggests rapid market movement since analysis
 
 ## Using PNL Data
 The portfolio includes unrealized PNL data for each position. Use this to:
@@ -136,6 +159,7 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         storage_port: StoragePort,
         trading_port: TradingPort,
         settings: Settings,
+        market_data_port: Optional[MarketDataPort] = None,
     ):
         """
         Initialize the DeepSeek manager agent.
@@ -145,14 +169,20 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
             storage_port: Storage for retrieving analyses and storing decisions
             trading_port: Trading interface for execution
             settings: Application settings
+            market_data_port: Optional market data port for fetching fresh prices
         """
         self.llm = llm
         self.storage = storage_port
         self.trading = trading_port
         self.settings = settings
+        self.market_data = market_data_port
     
-    def _format_analyses_summary(self, analyses: list[CoinAnalysis]) -> str:
-        """Format analyses into a summary for the manager."""
+    def _format_analyses_summary(
+        self,
+        analyses: list[CoinAnalysis],
+        fresh_prices: Optional[dict[str, TickerData]] = None,
+    ) -> str:
+        """Format analyses into a summary for the manager with fresh prices."""
         summaries = []
         
         for analysis in analyses:
@@ -160,11 +190,17 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
                 continue
             
             insight = analysis.gemini_insight
+            symbol = f"{analysis.ticker}USDT"
+            
+            # Get fresh price if available
+            fresh_ticker = fresh_prices.get(symbol) if fresh_prices else None
+            analysis_price = float(analysis.current_price)
+            
             summary = {
-                "symbol": f"{analysis.ticker}USDT",
+                "symbol": symbol,
                 "ticker": analysis.ticker,
-                "current_price": analysis.current_price,
-                "change_24h": f"{float(analysis.price_change_24h) * 100:.2f}%",
+                "analysis_price": analysis_price,
+                "change_24h_at_analysis": f"{float(analysis.price_change_24h) * 100:.2f}%",
                 "volume_24h_usdt": analysis.volume_24h,
                 "volume_rank": analysis.volume_rank,
                 "trend": insight.trend,
@@ -175,6 +211,40 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
                 "risk_factors": insight.risk_factors[:2],  # Top 2
                 "opportunity_factors": insight.opportunity_factors[:2],  # Top 2
             }
+            
+            # Add fresh price data if available
+            if fresh_ticker and fresh_ticker.last_price:
+                fresh_price = float(fresh_ticker.last_price)
+                summary["fresh_price"] = fresh_price
+                summary["fresh_change_24h"] = f"{float(fresh_ticker.change_24h) * 100:.2f}%"
+                
+                # Calculate price change since analysis
+                if analysis_price > 0:
+                    price_change_pct = ((fresh_price - analysis_price) / analysis_price) * 100
+                    summary["price_change_since_analysis"] = f"{price_change_pct:+.2f}%"
+            else:
+                # Fallback: use stale data from analysis
+                summary["fresh_price"] = analysis_price
+                summary["fresh_change_24h"] = f"{float(analysis.price_change_24h) * 100:.2f}% (stale)"
+                summary["price_change_since_analysis"] = "0.00% (stale)"
+            
+            # Add analysis age
+            if analysis.analysis_timestamp:
+                try:
+                    analyzed_time = analysis.analysis_timestamp
+                    # Handle both datetime and string formats
+                    if isinstance(analyzed_time, str):
+                        analyzed_time = datetime.fromisoformat(analyzed_time.replace("Z", "+00:00"))
+                    
+                    now = datetime.now(analyzed_time.tzinfo) if analyzed_time.tzinfo else datetime.now()
+                    age_seconds = (now - analyzed_time).total_seconds()
+                    if age_seconds < 3600:
+                        summary["analysis_age"] = f"{int(age_seconds / 60)} minutes ago"
+                    else:
+                        summary["analysis_age"] = f"{age_seconds / 3600:.1f} hours ago"
+                except (ValueError, TypeError):
+                    summary["analysis_age"] = "unknown"
+            
             summaries.append(summary)
         
         return json.dumps(summaries, indent=2)
@@ -258,6 +328,19 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         # Sort by volume rank
         analyses.sort(key=lambda a: a.volume_rank)
         
+        # Fetch fresh prices from market data
+        fresh_prices: Optional[dict[str, TickerData]] = None
+        if self.market_data:
+            try:
+                all_tickers = await self.market_data.get_all_tickers()
+                fresh_prices = {t.symbol: t for t in all_tickers}
+                logger.info("Fresh prices fetched", count=len(fresh_prices))
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch fresh prices, using stale analysis prices",
+                    error=str(e),
+                )
+        
         # Fetch current portfolio
         portfolio = await self.trading.get_portfolio()
         
@@ -267,7 +350,7 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         # Build the prompt
         user_prompt = f"""## Current Market Analyses (Top {len(analyses)} coins by volume)
 
-{self._format_analyses_summary(analyses)}
+{self._format_analyses_summary(analyses, fresh_prices)}
 
 ## Current Portfolio State
 
