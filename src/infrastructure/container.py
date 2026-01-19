@@ -10,15 +10,19 @@ from src.adapters.bitget.market_data_adapter import BitgetMarketDataAdapter
 from src.adapters.bitget.trading_adapter import BitgetTradingAdapter
 from src.adapters.bitget.trade_fills_cache import TradeFillsCache
 from src.adapters.dynamodb.repository import DynamoDBStorageAdapter
+from src.adapters.dynamodb.analysis_history_repository import DynamoDBAnalysisHistoryAdapter
 from src.adapters.fundamental.fundamental_data_service import FundamentalDataService
 from src.adapters.llm.deepseek_adapter import DeepSeekAdapter
 from src.adapters.llm.gemini_adapter import GeminiAdapter
 from src.adapters.storage.json_storage_adapter import JSONStorageAdapter
+from src.adapters.storage.json_analysis_history import JsonAnalysisHistoryAdapter
 from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
 from src.domain.ports.storage_port import StoragePort
+from src.domain.ports.analysis_history_port import AnalysisHistoryPort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
 from src.application.agents.gemini_analyst import GeminiAnalystAgent
+from src.application.services.outcome_backfill import OutcomeBackfillService
 from src.application.use_cases.investment_cycle import InvestmentCycleUseCase
 from src.infrastructure.config import Settings
 
@@ -38,6 +42,7 @@ class Container:
     market_data_adapter: BitgetMarketDataAdapter
     trading_adapter: BitgetTradingAdapter
     storage_adapter: StoragePort  # Can be JSON or DynamoDB
+    analysis_history_adapter: AnalysisHistoryPort  # Analysis history storage
     gemini_adapter: GeminiAdapter
     deepseek_adapter: DeepSeekAdapter
     fundamental_data_service: Optional[FundamentalDataPort]  # Fundamental data
@@ -45,6 +50,9 @@ class Container:
     # Agents
     analyst_agent: GeminiAnalystAgent
     manager_agent: DeepSeekManagerAgent
+    
+    # Services
+    outcome_backfill: OutcomeBackfillService
     
     # Use cases
     investment_cycle: InvestmentCycleUseCase
@@ -104,12 +112,17 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
     
     # Create storage adapter based on configuration
     storage_adapter: StoragePort
+    analysis_history_adapter: AnalysisHistoryPort
+    
     if settings.storage_type.lower() == "json":
         storage_adapter = JSONStorageAdapter(settings.json_storage_path)
+        analysis_history_adapter = JsonAnalysisHistoryAdapter()
     else:
         storage_adapter = DynamoDBStorageAdapter(settings)
+        analysis_history_adapter = DynamoDBAnalysisHistoryAdapter(settings)
         # Initialize DynamoDB tables
         await storage_adapter.initialize_tables()
+        await analysis_history_adapter.initialize_table()
     
     # Create fundamental data service if enabled
     fundamental_data_service: Optional[FundamentalDataPort] = None
@@ -125,6 +138,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         market_data_port=market_data_adapter,
         storage_port=storage_adapter,
         fundamental_data_port=fundamental_data_service,
+        analysis_history_port=analysis_history_adapter,
     )
     
     manager_agent = DeepSeekManagerAgent(
@@ -132,6 +146,12 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         storage_port=storage_adapter,
         trading_port=trading_adapter,
         settings=settings,
+        market_data_port=market_data_adapter,
+    )
+    
+    # Create services
+    outcome_backfill = OutcomeBackfillService(
+        history_port=analysis_history_adapter,
         market_data_port=market_data_adapter,
     )
     
@@ -150,11 +170,13 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         market_data_adapter=market_data_adapter,
         trading_adapter=trading_adapter,
         storage_adapter=storage_adapter,
+        analysis_history_adapter=analysis_history_adapter,
         gemini_adapter=gemini_adapter,
         deepseek_adapter=deepseek_adapter,
         fundamental_data_service=fundamental_data_service,
         analyst_agent=analyst_agent,
         manager_agent=manager_agent,
+        outcome_backfill=outcome_backfill,
         investment_cycle=investment_cycle,
         _initialized=True,
     )

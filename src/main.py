@@ -5,7 +5,7 @@ Usage:
     python -m src.main [OPTIONS]
 
 Options:
-    --mode          Execution mode: full, analyze-only, decide-only (default: full)
+    --mode          Execution mode: full, analyze-only, decide-only, backfill-outcomes (default: full)
     --dry-run       Run without executing trades (default: True)
     --live          Execute real trades (sets dry-run to False)
     --coins         Number of top coins to analyze (default: from config)
@@ -21,6 +21,9 @@ Examples:
     
     # Run decisions only (uses existing analyses)
     python -m src.main --mode decide-only
+    
+    # Run outcome backfill (records prediction accuracy)
+    python -m src.main --mode backfill-outcomes
     
     # Run full cycle with live trading (CAUTION!)
     python -m src.main --live
@@ -47,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument(
         "--mode",
-        choices=["full", "analyze-only", "decide-only"],
+        choices=["full", "analyze-only", "decide-only", "backfill-outcomes"],
         default="full",
         help="Execution mode (default: full)",
     )
@@ -136,6 +139,37 @@ async def run_async(args: argparse.Namespace) -> int:
         # Create container with dependencies
         logger.info("Initializing application...")
         container = await create_container(settings)
+        
+        # Handle backfill-outcomes mode separately
+        if args.mode == "backfill-outcomes":
+            logger.info("Running outcome backfill...")
+            stats = await container.outcome_backfill.backfill_pending()
+            
+            print("\n" + "=" * 60)
+            print("OUTCOME BACKFILL COMPLETE")
+            print("=" * 60)
+            print(f"Processed: {stats['processed']}")
+            print(f"Success: {stats['success']}")
+            print(f"Failed: {stats['failed']}")
+            print(f"Skipped: {stats['skipped']}")
+            
+            # Show accuracy report
+            report = await container.outcome_backfill.get_performance_report()
+            overall = report["overall"]
+            print(f"\nPrediction Accuracy:")
+            print(f"  Total with outcomes: {overall['total']}")
+            print(f"  Correct: {overall['correct']}")
+            print(f"  Wrong: {overall['wrong']}")
+            print(f"  Neutral: {overall['neutral']}")
+            print(f"  Accuracy: {overall['accuracy_pct']}%")
+            
+            print("\nBy Trend:")
+            for trend, data in report["by_trend"].items():
+                if data["total"] > 0:
+                    print(f"  {trend.capitalize()}: {data['correct']}/{data['total']} ({data['accuracy_pct']}%)")
+            
+            print("=" * 60)
+            return 0
         
         # Get cycle mode
         mode = get_cycle_mode(args.mode)

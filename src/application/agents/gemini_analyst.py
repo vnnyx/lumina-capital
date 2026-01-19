@@ -6,9 +6,11 @@ import json
 from datetime import datetime
 from typing import Optional
 
+from src.domain.entities.analysis_history import AnalysisHistoryEntry
 from src.domain.entities.coin_analysis import CoinAnalysis, GeminiInsight
 from src.domain.entities.fundamental_data import FundamentalData
 from src.domain.entities.market_data import MarketData, TickerData
+from src.domain.ports.analysis_history_port import AnalysisHistoryPort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.domain.ports.llm_port import LLMMessage, LLMPort
 from src.domain.ports.market_data_port import MarketDataPort
@@ -191,6 +193,7 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
         market_data_port: MarketDataPort,
         storage_port: StoragePort,
         fundamental_data_port: Optional[FundamentalDataPort] = None,
+        analysis_history_port: Optional[AnalysisHistoryPort] = None,
     ):
         """
         Initialize the Gemini analyst agent.
@@ -200,11 +203,13 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
             market_data_port: Market data source
             storage_port: Storage for analysis results
             fundamental_data_port: Optional fundamental data source
+            analysis_history_port: Optional history storage for prompt fine-tuning
         """
         self.llm = llm
         self.market_data = market_data_port
         self.storage = storage_port
         self.fundamental_data = fundamental_data_port
+        self.analysis_history = analysis_history_port
         self._cached_fundamental_data: Optional[FundamentalData] = None
     
     def _format_market_data_prompt(
@@ -365,6 +370,15 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
             
             # Store in DynamoDB
             await self.storage.save_coin_analysis(analysis)
+            
+            # Save to history for prompt fine-tuning
+            if self.analysis_history:
+                try:
+                    history_entry = AnalysisHistoryEntry.from_coin_analysis(analysis)
+                    await self.analysis_history.save_history(history_entry)
+                    logger.debug("saved_to_analysis_history", ticker=ticker)
+                except Exception as hist_err:
+                    logger.warning("failed_to_save_history", ticker=ticker, error=str(hist_err))
             
             logger.info(
                 "Coin analysis complete",
