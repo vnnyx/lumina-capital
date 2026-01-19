@@ -112,3 +112,25 @@ class AnalysisHistoryPort(ABC):
             Dict with accuracy stats: total, correct, wrong, neutral, accuracy_pct
         """
         ...
+    
+    @abstractmethod
+    async def get_history_by_outcome(
+        self,
+        ticker: str,
+        outcome_label: str,
+        limit: int = 5,
+        max_age_days: int = 14,
+    ) -> list[AnalysisHistoryEntry]:
+        """
+        Get historical entries filtered by outcome label for prompt fine-tuning.
+        
+        Args:
+            ticker: Coin ticker (e.g., "BTC")
+            outcome_label: "correct", "wrong", or "neutral"
+            limit: Maximum entries to return
+            max_age_days: Only include entries from the last N days
+            
+        Returns:
+            List of history entries matching the outcome, newest first.
+        """
+        ...

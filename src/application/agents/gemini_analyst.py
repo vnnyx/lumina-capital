@@ -123,6 +123,12 @@ Analyze the provided market data and fundamental data for a cryptocurrency and p
 10. **Risk Factors**: Note any concerning patterns or risks (technical AND fundamental)
 11. **Opportunity Factors**: Highlight potential opportunities
 
+## Historical Performance Learning
+When historical performance data is provided, use it to calibrate your analysis:
+- **Correct predictions**: Learn from patterns that led to successful predictions
+- **Wrong predictions**: Avoid patterns that previously led to incorrect predictions
+- **Accuracy stats**: Calibrate your confidence based on past accuracy for this coin
+
 ## Output Requirements
 You MUST respond with valid JSON matching the exact schema provided. Be specific and quantitative where possible. Base all conclusions on the data provided. When fundamental data is available, integrate it into your analysis.
 """
@@ -211,6 +217,104 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
         self.fundamental_data = fundamental_data_port
         self.analysis_history = analysis_history_port
         self._cached_fundamental_data: Optional[FundamentalData] = None
+    
+    async def _build_history_context(self, ticker: str) -> str:
+        """
+        Build historical context from past predictions for prompt fine-tuning.
+        
+        Fetches correct and wrong predictions to provide few-shot examples
+        and accuracy stats for confidence calibration.
+        
+        Args:
+            ticker: Coin ticker (e.g., "BTC")
+            
+        Returns:
+            Formatted string with historical context, or empty string if no history.
+        """
+        if not self.analysis_history:
+            return ""
+        
+        try:
+            # Fetch correct predictions (patterns to follow)
+            correct_entries = await self.analysis_history.get_history_by_outcome(
+                ticker=ticker,
+                outcome_label="correct",
+                limit=3,
+                max_age_days=14,
+            )
+            
+            # Fetch wrong predictions (anti-patterns to avoid)
+            wrong_entries = await self.analysis_history.get_history_by_outcome(
+                ticker=ticker,
+                outcome_label="wrong",
+                limit=2,
+                max_age_days=14,
+            )
+            
+            # Fetch accuracy stats for calibration
+            accuracy_stats = await self.analysis_history.get_accuracy_stats(ticker)
+            
+            # If no history at all, return empty (cold start)
+            if not correct_entries and not wrong_entries and accuracy_stats.get("total", 0) == 0:
+                logger.debug("no_history_context_available", ticker=ticker)
+                return ""
+            
+            # Build the context string
+            context_parts = ["\n\n## Historical Performance Data"]
+            
+            # Add accuracy stats section
+            if accuracy_stats.get("total", 0) > 0:
+                context_parts.append(f"""
+### Accuracy Statistics (Last 14 Days)
+- Total predictions: {accuracy_stats['total']}
+- Correct: {accuracy_stats['correct']} ({accuracy_stats['accuracy_pct']:.1f}%)
+- Wrong: {accuracy_stats['wrong']}
+- Neutral: {accuracy_stats['neutral']}
+
+Use these stats to calibrate your confidence. {"Higher confidence is justified." if accuracy_stats['accuracy_pct'] >= 60 else "Be more cautious with predictions." if accuracy_stats['accuracy_pct'] < 50 else "Maintain balanced confidence."}""")
+            
+            # Add correct predictions as patterns to follow
+            if correct_entries:
+                context_parts.append("\n### Successful Predictions (Patterns to Follow)")
+                for i, entry in enumerate(correct_entries, 1):
+                    outcome = entry.outcome
+                    context_parts.append(f"""
+**Example {i}**: {entry.timestamp.strftime('%Y-%m-%d %H:%M')}
+- Price at analysis: ${entry.price_at_analysis:,.2f} (24h change: {entry.change_24h_at_analysis:+.2f}%)
+- Prediction: {entry.predicted_trend} trend, {entry.predicted_momentum} momentum
+- Volatility score: {entry.volatility_score:.2f}
+- Outcome: ✅ Price moved {outcome.price_change_pct:+.2f}% in 4h (correctly predicted)
+- Key observations: {', '.join(entry.key_observations[:2]) if entry.key_observations else 'N/A'}""")
+            
+            # Add wrong predictions as anti-patterns
+            if wrong_entries:
+                context_parts.append("\n### Failed Predictions (Anti-Patterns to Avoid)")
+                for i, entry in enumerate(wrong_entries, 1):
+                    outcome = entry.outcome
+                    context_parts.append(f"""
+**Mistake {i}**: {entry.timestamp.strftime('%Y-%m-%d %H:%M')}
+- Price at analysis: ${entry.price_at_analysis:,.2f} (24h change: {entry.change_24h_at_analysis:+.2f}%)
+- Prediction: {entry.predicted_trend} trend, {entry.predicted_momentum} momentum
+- Volatility score: {entry.volatility_score:.2f}
+- Outcome: ❌ Price moved {outcome.price_change_pct:+.2f}% in 4h (prediction was wrong)
+- Key observations: {', '.join(entry.key_observations[:2]) if entry.key_observations else 'N/A'}
+- Lesson: Avoid similar pattern recognition that led to this incorrect prediction.""")
+            
+            context_parts.append("\n\nUse the above historical data to improve your current analysis accuracy.")
+            
+            logger.debug(
+                "built_history_context",
+                ticker=ticker,
+                correct_count=len(correct_entries),
+                wrong_count=len(wrong_entries),
+                total_predictions=accuracy_stats.get("total", 0),
+            )
+            
+            return "\n".join(context_parts)
+            
+        except Exception as e:
+            logger.warning("failed_to_build_history_context", ticker=ticker, error=str(e))
+            return ""
     
     def _format_market_data_prompt(
         self,
@@ -309,6 +413,11 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
         
         # Generate analysis prompt
         user_prompt = self._format_market_data_prompt(market_data, volume_rank, fund_data)
+        
+        # Build historical context for prompt fine-tuning
+        history_context = await self._build_history_context(ticker)
+        if history_context:
+            user_prompt += history_context
         
         # Get Gemini analysis
         try:

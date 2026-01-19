@@ -287,3 +287,46 @@ class DynamoDBAnalysisHistoryAdapter(AnalysisHistoryPort):
         except Exception as e:
             logger.error("failed_to_get_accuracy_stats", error=str(e))
             return {"total": 0, "correct": 0, "wrong": 0, "neutral": 0, "accuracy_pct": 0.0}
+
+    async def get_history_by_outcome(
+        self,
+        ticker: str,
+        outcome_label: str,
+        limit: int = 5,
+        max_age_days: int = 14,
+    ) -> list[AnalysisHistoryEntry]:
+        """Get historical entries filtered by outcome label for prompt fine-tuning."""
+        try:
+            cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat()
+            
+            # Query by ticker with filter on outcome_label and timestamp
+            response = self.table.query(
+                KeyConditionExpression=Key("pk").eq(ticker) & Key("sk").gte(cutoff),
+                FilterExpression=Attr("outcome.outcome_label").eq(outcome_label),
+                ScanIndexForward=False,  # Newest first
+                Limit=limit * 2,  # Over-fetch since filter is applied after
+            )
+            
+            items = response.get("Items", [])
+            
+            entries = [
+                AnalysisHistoryEntry.from_dict(convert_decimals_to_float(item))
+                for item in items
+            ]
+            
+            # Filter and limit (in case DynamoDB filter didn't fully apply)
+            filtered = [
+                e for e in entries
+                if e.outcome and e.outcome.outcome_label == outcome_label
+            ][:limit]
+            
+            logger.debug(
+                "get_history_by_outcome",
+                ticker=ticker,
+                outcome_label=outcome_label,
+                count=len(filtered),
+            )
+            return filtered
+        except ClientError as e:
+            logger.error("failed_to_get_history_by_outcome", error=str(e))
+            return []

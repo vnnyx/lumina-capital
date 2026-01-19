@@ -193,3 +193,42 @@ class JsonAnalysisHistoryAdapter(AnalysisHistoryPort):
             "accuracy_pct": round(accuracy_pct, 2),
             "ticker": ticker,
         }
+
+    async def get_history_by_outcome(
+        self,
+        ticker: str,
+        outcome_label: str,
+        limit: int = 5,
+        max_age_days: int = 14,
+    ) -> list[AnalysisHistoryEntry]:
+        """Get historical entries filtered by outcome label for prompt fine-tuning."""
+        data = self._read_data()
+        history = self._filter_expired(data.get("history", []))
+        
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        
+        # Filter by ticker, outcome_label, and age
+        filtered = []
+        for entry_dict in history:
+            # Check ticker
+            if entry_dict.get("ticker") != ticker:
+                continue
+            
+            # Check outcome exists and matches
+            outcome = entry_dict.get("outcome")
+            if not outcome or outcome.get("outcome_label") != outcome_label:
+                continue
+            
+            # Check timestamp is within max_age_days
+            timestamp = entry_dict.get("timestamp")
+            if isinstance(timestamp, str):
+                timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if timestamp < cutoff:
+                continue
+            
+            filtered.append(entry_dict)
+        
+        # Sort by timestamp descending (newest first)
+        filtered.sort(key=lambda e: e["timestamp"], reverse=True)
+        
+        return [AnalysisHistoryEntry.from_dict(e) for e in filtered[:limit]]
