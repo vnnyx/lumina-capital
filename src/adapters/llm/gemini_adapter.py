@@ -147,8 +147,13 @@ class GeminiAdapter(LLMPort):
         if response.candidates and response.candidates[0].finish_reason:
             finish_reason = str(response.candidates[0].finish_reason).lower()
         
+        # Check for empty/blocked responses
+        content = response.text if response.text is not None else ""
+        if not content:
+            logger.warning("Gemini returned empty response", finish_reason=finish_reason)
+        
         return LLMResponse(
-            content=response.text,
+            content=content,
             model=self._model_name,
             usage=usage,
             finish_reason=finish_reason,
@@ -202,6 +207,10 @@ class GeminiAdapter(LLMPort):
         )
         
         # Parse JSON response
+        if not response.content:
+            logger.error("Empty response from Gemini", finish_reason=response.finish_reason)
+            raise ValueError("Gemini returned empty response - likely blocked by safety filters")
+        
         try:
             return json.loads(response.content)
         except json.JSONDecodeError as e:

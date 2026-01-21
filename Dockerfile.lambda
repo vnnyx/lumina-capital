@@ -1,0 +1,31 @@
+# Lambda-specific Dockerfile
+# Build stage
+FROM python:3.13.7-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies to a specific directory
+RUN pip install --no-cache-dir --target=/app/dependencies -r requirements.txt
+
+# Lambda runtime stage
+FROM public.ecr.aws/lambda/python:3.13
+
+# Copy dependencies
+COPY --from=builder /app/dependencies ${LAMBDA_TASK_ROOT}/
+
+# Copy application code
+COPY src/ ${LAMBDA_TASK_ROOT}/src/
+
+# Set Python path
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}
+
+# Set the Lambda handler
+CMD ["src.adapters.lambda_handler.handler"]

@@ -66,8 +66,8 @@ class DynamoDBStorageAdapter(StoragePort):
             settings: Application settings with AWS credentials.
         """
         self.settings = settings
-        self.table_name = settings.dynamodb_table_name
-        self.decisions_table_name = f"{settings.dynamodb_table_name}_decisions"
+        self.table_name = f"{settings.dynamodb_table_name}_coin_analyses"
+        self.decisions_table_name = f"{settings.dynamodb_table_name}_trade_decisions"
         
         # Configure DynamoDB client
         client_kwargs: dict[str, Any] = {
@@ -78,11 +78,6 @@ class DynamoDBStorageAdapter(StoragePort):
         if settings.use_local_dynamodb:
             client_kwargs["endpoint_url"] = settings.dynamodb_endpoint_url
             logger.info("Using local DynamoDB", endpoint=settings.dynamodb_endpoint_url)
-        
-        # Use explicit credentials if provided
-        if settings.aws_access_key_id and settings.aws_secret_access_key:
-            client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-            client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
         
         self.dynamodb = boto3.resource("dynamodb", **client_kwargs)
         self.table = self.dynamodb.Table(self.table_name)

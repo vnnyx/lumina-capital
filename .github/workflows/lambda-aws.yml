@@ -1,0 +1,150 @@
+name: Lambda AWS Automated Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: lumina-capital
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    outputs:
+      CONTAINER_IMAGE: ${{ steps.build_env.outputs.CONTAINER_IMAGE }}
+      APP_VERSION: ${{ steps.build_env.outputs.APP_VERSION }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: "Git checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: "0"
+
+      - name: "Setup environment variables"
+        run: |
+          # Set app version to commit SHA
+          echo APP_VERSION=${{ github.sha }} >> $GITHUB_ENV
+
+          echo ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }} >> $GITHUB_ENV
+          echo FULL_REPO_NAME=${{ env.ECR_REPOSITORY }} >> $GITHUB_ENV
+
+      - name: Build Docker image for Lambda
+        run: docker build -f Dockerfile.lambda -t $ECR_REGISTRY/$FULL_REPO_NAME:$APP_VERSION .
+
+      - name: Tag image as latest
+        run: docker tag $ECR_REGISTRY/$FULL_REPO_NAME:$APP_VERSION $ECR_REGISTRY/$FULL_REPO_NAME:latest
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push $ECR_REGISTRY/$FULL_REPO_NAME:$APP_VERSION
+          docker push $ECR_REGISTRY/$FULL_REPO_NAME:latest
+
+      - name: "Get image digest"
+        id: get-image-digest
+        run: |
+          IMAGE_DIGEST=$(aws ecr describe-images --repository-name $FULL_REPO_NAME \
+            --query 'imageDetails[?contains(imageTags, `'"$APP_VERSION"'`)].imageDigest' --output text)
+
+          echo IMAGE_DIGEST=$IMAGE_DIGEST >> $GITHUB_ENV
+          echo CONTAINER_IMAGE=$ECR_REGISTRY/$FULL_REPO_NAME@$IMAGE_DIGEST >> $GITHUB_ENV
+
+      - name: "Export environment"
+        id: "build_env"
+        run: |
+          echo CONTAINER_IMAGE=$CONTAINER_IMAGE >> $GITHUB_OUTPUT
+          echo APP_VERSION=$APP_VERSION >> $GITHUB_OUTPUT
+
+  deploy-lambdas:
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        function:
+          - name: lumina-capital-coin-analysis
+            handler: src.adapters.lambda_handler.coin_analysis_handler
+          - name: lumina-capital-analysis-history
+            handler: src.adapters.lambda_handler.history_backfill_handler
+          - name: lumina-capital-trade-decision
+            handler: src.adapters.lambda_handler.decision_handler
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Set environment variables"
+        run: |
+          echo CONTAINER_IMAGE=${{ needs.build-and-push-image.outputs.CONTAINER_IMAGE }} >> $GITHUB_ENV
+          echo APP_VERSION=${{ needs.build-and-push-image.outputs.APP_VERSION }} >> $GITHUB_ENV
+          echo LAMBDA_FUNCTION_NAME=${{ matrix.function.name }} >> $GITHUB_ENV
+          echo SECRET_NAME=config/lumina-capital >> $GITHUB_ENV
+
+      - name: "Fetch config from Secrets Manager"
+        id: fetch-secrets
+        run: |
+          # Fetch the secret key-value pairs from AWS Secrets Manager
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id $SECRET_NAME \
+            --query SecretString \
+            --output text)
+
+          # Convert key-value JSON to Lambda environment variables format
+          echo "{\"Variables\": $SECRET_JSON}" > /tmp/env-vars-${{ matrix.function.name }}.json
+
+      - name: "Update Lambda function code"
+        run: |
+          aws lambda update-function-code \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --image-uri $CONTAINER_IMAGE
+
+      - name: "Wait for code update"
+        run: |
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION_NAME
+
+      - name: "Update Lambda environment variables"
+        run: |
+          aws lambda update-function-configuration \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --environment file:///tmp/env-vars-${{ matrix.function.name }}.json
+
+      - name: "Wait for environment update"
+        run: |
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION_NAME
+
+      - name: "Update Lambda function configuration"
+        run: |
+          aws lambda update-function-configuration \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --image-config Command=${{ matrix.function.handler }}
+
+      - name: "Wait for configuration update"
+        run: |
+          aws lambda wait function-updated \
+            --function-name $LAMBDA_FUNCTION_NAME
+
+      - name: "Publish new version"
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --description "Deployed version $APP_VERSION" \
+            --query 'Version' \
+            --output text)
+          
+          echo "Published Lambda version: $VERSION for function: $LAMBDA_FUNCTION_NAME"

@@ -59,7 +59,7 @@ async def async_handler(event: dict[str, Any]) -> dict[str, Any]:
     Returns:
         Response with cycle results.
     """
-    logger.info("Lambda handler invoked", event=event)
+    logger.info("Lambda handler invoked", lambda_event=event)
     
     # Parse event parameters
     mode_str = event.get("mode", os.environ.get("CYCLE_MODE", "full"))
@@ -160,6 +160,105 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     
     # Run async handler
     return asyncio.run(async_handler(event))
+
+
+def coin_analysis_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """
+    Lambda handler for coin analysis only.
+    Runs every 4 hours to analyze top coins with Gemini.
+    
+    Args:
+        event: Lambda event data
+        context: Lambda context object
+        
+    Returns:
+        Response dictionary with analysis results.
+    """
+    # Force analyze-only mode
+    event["mode"] = "analyze-only"
+    return handler(event, context)
+
+
+def history_backfill_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """
+    Lambda handler for analysis history backfill.
+    Runs every 4 hours to update prediction outcomes.
+    
+    Args:
+        event: Lambda event data
+        context: Lambda context object
+        
+    Returns:
+        Response dictionary with backfill results.
+    """
+    logger.info("History backfill handler invoked", lambda_event=event)
+    
+    if context:
+        logger.info(
+            "Lambda context",
+            function_name=getattr(context, "function_name", "unknown"),
+            memory_limit=getattr(context, "memory_limit_in_mb", "unknown"),
+        )
+    
+    try:
+        from src.application.services.outcome_backfill import OutcomeBackfillService
+        
+        settings = Settings()
+        
+        async def run_backfill():
+            container = await create_container(settings)
+            
+            # Get backfill service
+            backfill_service = OutcomeBackfillService(
+                history_port=container.analysis_history_adapter,
+                market_data_port=container.market_data_adapter,
+            )
+            
+            # Run backfill
+            stats = await backfill_service.backfill_pending()
+            
+            await cleanup_container()
+            
+            return stats
+        
+        stats = asyncio.run(run_backfill())
+        
+        logger.info("History backfill complete", **stats)
+        
+        return {
+            "statusCode": 200,
+            "body": {
+                "success": True,
+                "stats": stats,
+            },
+        }
+        
+    except Exception as e:
+        logger.exception("History backfill failed", error=str(e))
+        return {
+            "statusCode": 500,
+            "body": {
+                "success": False,
+                "error": str(e),
+            },
+        }
+
+
+def decision_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """
+    Lambda handler for trade decisions only.
+    Runs every 2 hours to make trading decisions with DeepSeek.
+    
+    Args:
+        event: Lambda event data
+        context: Lambda context object
+        
+    Returns:
+        Response dictionary with decision results.
+    """
+    # Force decide-only mode
+    event["mode"] = "decide-only"
+    return handler(event, context)
 
 
 # For local testing
