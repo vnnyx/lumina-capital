@@ -7,7 +7,7 @@ on:
 
 env:
   AWS_REGION: ap-southeast-1
-  ECR_REPOSITORY: lumina-capital
+  ECR_REPOSITORY: vnnyx/lumina-capital
 
 jobs:
   build-and-push-image:
