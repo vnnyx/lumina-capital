@@ -55,11 +55,39 @@ jobs:
       - name: "Get image digest"
         id: get-image-digest
         run: |
-          IMAGE_DIGEST=$(aws ecr describe-images --repository-name $FULL_REPO_NAME \
-            --query 'imageDetails[?contains(imageTags, `'"$APP_VERSION"'`)].imageDigest' --output text)
-
-          echo IMAGE_DIGEST=$IMAGE_DIGEST >> $GITHUB_ENV
-          echo CONTAINER_IMAGE=$ECR_REGISTRY/$FULL_REPO_NAME@$IMAGE_DIGEST >> $GITHUB_ENV
+          echo "Waiting for image to be indexed in ECR..."
+          echo "Repository: $FULL_REPO_NAME"
+          echo "Tag: $APP_VERSION"
+          
+          MAX_ATTEMPTS=24  # 2 minutes total (24 * 5s)
+          ATTEMPT=1
+          SLEEP_TIME=5
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+            
+            IMAGE_DIGEST=$(aws ecr describe-images \
+              --repository-name $FULL_REPO_NAME \
+              --image-ids imageTag=$APP_VERSION \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>/dev/null || echo "")
+            
+            # Check if we got a valid SHA256 digest
+            if [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+              echo "✓ Image found with digest: $IMAGE_DIGEST"
+              echo IMAGE_DIGEST=$IMAGE_DIGEST >> $GITHUB_ENV
+              echo CONTAINER_IMAGE=$ECR_REGISTRY/$FULL_REPO_NAME@$IMAGE_DIGEST >> $GITHUB_ENV
+              exit 0
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              sleep $SLEEP_TIME
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          echo "✗ Error: Image not found after $((MAX_ATTEMPTS * SLEEP_TIME)) seconds"
+          exit 1
 
       - name: "Export environment"
         id: "build_env"
