@@ -13,6 +13,12 @@ from src.domain.entities.fundamental_data import (
     CoinMetrics,
     NewsItem,
 )
+from src.domain.entities.trade_outcome import (
+    TradeOutcome,
+    OutcomeStatus,
+    PositionPerformance,
+    PortfolioStats,
+)
 
 __all__ = [
     "Coin",
@@ -30,4 +36,8 @@ __all__ = [
     "FearGreedIndex",
     "CoinMetrics",
     "NewsItem",
+    "TradeOutcome",
+    "OutcomeStatus",
+    "PositionPerformance",
+    "PortfolioStats",
 ]

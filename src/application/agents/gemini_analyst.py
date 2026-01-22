@@ -19,6 +19,12 @@ from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Stablecoins to exclude from analysis (they provide no trading alpha)
+STABLECOIN_TICKERS = frozenset({
+    "USDT", "USDC", "DAI", "TUSD", "FDUSD", "BUSD", "USDP", "GUSD", 
+    "FRAX", "LUSD", "SUSD", "USDD", "CUSD", "USTC", "PYUSD", "EURC"
+})
+
 
 class GeminiAnalystAgent:
     """
@@ -526,6 +532,20 @@ Use these stats to calibrate your confidence. {"Higher confidence is justified."
         
         # Fetch top coins by volume
         top_tickers = await self.market_data.get_top_coins_by_volume(limit=limit)
+        
+        # Filter out stablecoins (they provide no trading alpha)
+        original_count = len(top_tickers)
+        top_tickers = [
+            t for t in top_tickers
+            if t.symbol.replace("USDT", "") not in STABLECOIN_TICKERS
+        ]
+        filtered_count = original_count - len(top_tickers)
+        if filtered_count > 0:
+            logger.info(
+                "Filtered stablecoins from analysis",
+                filtered=filtered_count,
+                remaining=len(top_tickers),
+            )
         
         # Build set of symbols already in top coins for deduplication
         top_symbols_set = {t.symbol for t in top_tickers}

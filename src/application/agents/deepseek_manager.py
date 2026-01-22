@@ -10,10 +10,12 @@ from src.domain.entities.coin_analysis import CoinAnalysis
 from src.domain.entities.market_data import TickerData
 from src.domain.entities.portfolio import Portfolio
 from src.domain.entities.trade_decision import TradeAction, TradeDecision
+from src.domain.entities.trade_outcome import PortfolioStats, PositionPerformance, TradeOutcome
 from src.domain.ports.llm_port import LLMMessage, LLMPort
 from src.domain.ports.market_data_port import MarketDataPort
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.trading_port import TradingPort
+from src.domain.ports.trade_outcome_port import TradeOutcomePort
 from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
 
@@ -68,6 +70,11 @@ You receive:
    - unrealized_pnl: Unrealized profit/loss in USDT
    - unrealized_pnl_pct: Unrealized P&L as a percentage
 3. Recent trading decisions for context
+4. **Your Historical Trade Performance** (CRITICAL for learning):
+   - Recent closed trades with actual realized P&L
+   - Per-coin win rates and average P&L
+   - Portfolio-wide statistics: total trades, win rate, current streak
+   - USE THIS DATA to learn from past successes and mistakes!
 
 ## Using Price Data
 The analysis includes both the price at analysis time and the current fresh price. Use this to:
@@ -91,11 +98,20 @@ The portfolio includes unrealized PNL data for each position. Use this to:
 - Consider unrealized_pnl_pct to assess the magnitude of gains/losses
 - Note: If PNL shows 0%, it means we don't have historical cost basis data for that position
 
+## Learning from Trade History
+You receive your historical trade performance data. CRITICAL: Use this to improve decisions:
+- If a coin has high win rate in your history, consider it for similar setups
+- If a coin has been consistently losing, be more cautious or avoid it
+- If your current streak is negative (losing), consider being more conservative
+- Review your average holding duration to inform timing decisions
+- Your past mistakes are learning opportunities - don't repeat patterns that led to losses
+
 ## Your Task
 1. Review all market analyses and current portfolio state (including PNL)
-2. Develop your investment thesis and risk management approach
-3. Make specific, actionable trading decisions
-4. Provide clear reasoning for each decision, referencing PNL when relevant
+2. **Review your trade history to understand what worked and what didn't**
+3. Develop your investment thesis and risk management approach
+4. Make specific, actionable trading decisions
+5. Provide clear reasoning for each decision, referencing PNL and historical performance when relevant
 
 ## Decision Framework (suggestions, not requirements)
 - Consider correlation between assets
@@ -160,6 +176,7 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         trading_port: TradingPort,
         settings: Settings,
         market_data_port: Optional[MarketDataPort] = None,
+        trade_outcome_port: Optional[TradeOutcomePort] = None,
     ):
         """
         Initialize the DeepSeek manager agent.
@@ -170,12 +187,14 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
             trading_port: Trading interface for execution
             settings: Application settings
             market_data_port: Optional market data port for fetching fresh prices
+            trade_outcome_port: Optional port for trade outcome/P&L history
         """
         self.llm = llm
         self.storage = storage_port
         self.trading = trading_port
         self.settings = settings
         self.market_data = market_data_port
+        self.trade_outcomes = trade_outcome_port
     
     def _format_analyses_summary(
         self,
@@ -250,18 +269,30 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         return json.dumps(summaries, indent=2)
     
     def _format_portfolio_summary(self, portfolio: Portfolio) -> str:
-        """Format portfolio into a summary for the manager with PNL data."""
+        """Format portfolio into a summary for the manager with PNL data and health metrics."""
         min_balance = self.settings.min_portfolio_balance
+        
+        # Critical warning for no available capital
+        capital_warning = None
+        if portfolio.usdt_balance <= 0:
+            capital_warning = "⚠️ CRITICAL: NO USDT AVAILABLE FOR BUYING! You CANNOT execute any BUY orders. Only SELL or HOLD actions are possible."
+        elif portfolio.usdt_balance < 10:
+            capital_warning = f"⚠️ WARNING: Very low USDT balance ({portfolio.usdt_balance:.2f}). Consider selling positions before buying."
         
         summary = {
             "available_usdt": portfolio.usdt_balance,
+            "capital_warning": capital_warning,
             "total_positions": portfolio.total_positions,
             "min_balance_filter": min_balance,
             "positions": [],
             "total_unrealized_pnl": 0.0,
+            "health_metrics": {},  # Portfolio health indicators
         }
         
         total_pnl = 0.0
+        position_values: list[tuple[str, float]] = []  # (coin, value) for concentration calc
+        winning_positions = 0
+        losing_positions = 0
         
         for position in portfolio.positions:
             # Filter out dust positions below minimum balance threshold
@@ -276,6 +307,9 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
                 # Add PNL data if available
                 if position.current_price is not None:
                     pos_data["current_price"] = round(position.current_price, 6)
+                    # Calculate position value for concentration metrics
+                    pos_value = position.total_balance * position.current_price
+                    position_values.append((position.coin, pos_value))
                 
                 if position.avg_entry_price is not None:
                     pos_data["avg_entry_price"] = round(position.avg_entry_price, 6)
@@ -283,6 +317,11 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
                 if position.unrealized_pnl is not None:
                     pos_data["unrealized_pnl"] = round(position.unrealized_pnl, 2)
                     total_pnl += position.unrealized_pnl
+                    # Track winning/losing positions
+                    if position.unrealized_pnl > 0:
+                        winning_positions += 1
+                    elif position.unrealized_pnl < 0:
+                        losing_positions += 1
                 
                 if position.unrealized_pnl_pct is not None:
                     pos_data["unrealized_pnl_pct"] = round(position.unrealized_pnl_pct, 2)
@@ -290,6 +329,39 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
                 summary["positions"].append(pos_data)
         
         summary["total_unrealized_pnl"] = round(total_pnl, 2)
+        
+        # Calculate portfolio health metrics
+        total_portfolio_value = portfolio.usdt_balance + sum(v for _, v in position_values)
+        
+        if total_portfolio_value > 0 and position_values:
+            # Sort positions by value (descending)
+            position_values.sort(key=lambda x: x[1], reverse=True)
+            
+            # Calculate concentration metrics
+            largest_position = position_values[0]
+            largest_pct = (largest_position[1] / total_portfolio_value) * 100
+            
+            # Top 3 concentration
+            top3_value = sum(v for _, v in position_values[:3])
+            top3_pct = (top3_value / total_portfolio_value) * 100
+            
+            # Cash ratio
+            cash_pct = (portfolio.usdt_balance / total_portfolio_value) * 100
+            
+            summary["health_metrics"] = {
+                "total_portfolio_value_usdt": round(total_portfolio_value, 2),
+                "cash_percentage": round(cash_pct, 1),
+                "largest_position": {
+                    "coin": largest_position[0],
+                    "value_usdt": round(largest_position[1], 2),
+                    "percentage": round(largest_pct, 1),
+                },
+                "top3_concentration_pct": round(top3_pct, 1),
+                "winning_positions": winning_positions,
+                "losing_positions": losing_positions,
+                "diversification_score": len(position_values),  # Number of positions
+                "concentration_warning": largest_pct > 30,  # Soft warning, not blocking
+            }
         
         return json.dumps(summary, indent=2)
     
@@ -309,6 +381,75 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
             })
         
         return json.dumps(formatted, indent=2)
+    
+    async def _format_trade_history(self) -> str:
+        """Format trade outcome history for learning context."""
+        if not self.trade_outcomes:
+            return "No trade history available yet."
+        
+        try:
+            # Get portfolio-wide stats
+            stats = await self.trade_outcomes.get_portfolio_stats()
+            
+            # Get recent closed trades (last 20)
+            recent_outcomes = await self.trade_outcomes.get_recent_outcomes(limit=20)
+            
+            # Get per-position performance
+            position_perfs = await self.trade_outcomes.get_all_position_performance()
+            
+            history = {
+                "portfolio_stats": {
+                    "total_closed_trades": stats.total_trades,
+                    "winning_trades": stats.winning_trades,
+                    "losing_trades": stats.losing_trades,
+                    "win_rate_pct": round(stats.win_rate, 1),
+                    "total_realized_pnl": round(stats.total_realized_pnl, 2),
+                    "largest_win": round(stats.largest_win, 2),
+                    "largest_loss": round(stats.largest_loss, 2),
+                    "current_streak": stats.current_streak,
+                    "max_winning_streak": stats.max_winning_streak,
+                    "max_losing_streak": stats.max_losing_streak,
+                },
+                "per_coin_performance": [],
+                "recent_trades": [],
+            }
+            
+            # Add per-coin performance
+            for perf in position_perfs:
+                if perf.total_trades > 0:
+                    history["per_coin_performance"].append({
+                        "coin": perf.coin,
+                        "total_trades": perf.total_trades,
+                        "win_rate_pct": round(perf.win_rate, 1),
+                        "total_pnl": round(perf.total_realized_pnl, 2),
+                        "avg_pnl_per_trade": round(perf.avg_pnl_per_trade, 2),
+                        "avg_holding_hours": round(perf.avg_holding_duration_hours, 1),
+                        "best_trade": round(perf.best_trade_pnl, 2),
+                        "worst_trade": round(perf.worst_trade_pnl, 2),
+                    })
+            
+            # Add recent trades (last 20)
+            for outcome in recent_outcomes:
+                trade_summary = {
+                    "coin": outcome.coin,
+                    "entry_price": round(outcome.entry_price, 6),
+                    "exit_price": round(outcome.exit_price, 6) if outcome.exit_price else None,
+                    "quantity": round(outcome.entry_quantity, 6),
+                    "realized_pnl": round(outcome.realized_pnl, 2) if outcome.realized_pnl else 0,
+                    "realized_pnl_pct": round(outcome.realized_pnl_pct, 2) if outcome.realized_pnl_pct else 0,
+                    "holding_hours": round(outcome.holding_duration_hours, 1) if outcome.holding_duration_hours else 0,
+                    "result": "WIN" if outcome.is_winner else "LOSS",
+                }
+                history["recent_trades"].append(trade_summary)
+            
+            if stats.total_trades == 0:
+                return "No closed trades yet. This is the beginning of your trading history."
+            
+            return json.dumps(history, indent=2)
+            
+        except Exception as e:
+            logger.warning("Failed to format trade history", error=str(e))
+            return "Trade history temporarily unavailable."
     
     async def generate_decisions(self) -> list[TradeDecision]:
         """
@@ -347,6 +488,9 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
         # Fetch recent decisions for context
         recent_decisions = await self.storage.get_recent_decisions(limit=10)
         
+        # Fetch trade outcome history for learning
+        trade_history = await self._format_trade_history()
+        
         # Build the prompt
         user_prompt = f"""## Current Market Analyses (Top {len(analyses)} coins by volume)
 
@@ -355,6 +499,10 @@ Be decisive. If you believe no action is optimal, explicitly state "hold" with r
 ## Current Portfolio State
 
 {self._format_portfolio_summary(portfolio)}
+
+## Your Trade History (LEARN FROM THIS!)
+
+{trade_history}
 
 ## Recent Trading Decisions (for context)
 
@@ -369,9 +517,10 @@ Based on the above data, provide your trading decisions. Consider:
 1. Current market conditions and trends
 2. Portfolio diversification and risk
 3. Liquidity and volume considerations
-4. Your confidence in each decision
+4. **Your historical trade performance - what worked? what didn't?**
+5. Your confidence in each decision
 
-Remember: You have FULL AUTONOMY. Make the decisions you believe are best for portfolio growth and stability."""
+Remember: You have FULL AUTONOMY. Make the decisions you believe are best for portfolio growth and stability. LEARN from your past trades!"""
 
         # Get DeepSeek analysis
         try:
@@ -462,7 +611,46 @@ Remember: You have FULL AUTONOMY. Make the decisions you believe are best for po
             logger.info("No actionable decisions to execute")
             return results
         
+        # Check available USDT for buy orders - HARD GUARDRAIL
+        portfolio = await self.trading.get_portfolio()
+        available_usdt = portfolio.usdt_balance
+        
         for decision in actionable:
+            # Block buy orders when there's no USDT available
+            if decision.action == TradeAction.BUY:
+                required_amount = float(decision.quantity) if decision.quantity else 0
+                if available_usdt <= 0:
+                    logger.warning(
+                        "BLOCKED: Cannot buy with 0 USDT",
+                        symbol=decision.symbol,
+                        quantity=decision.quantity,
+                        available_usdt=available_usdt,
+                    )
+                    results.append({
+                        "decision": decision.to_dict(),
+                        "executed": False,
+                        "blocked": True,
+                        "reason": "No USDT available for buying",
+                    })
+                    continue
+                elif required_amount > available_usdt:
+                    logger.warning(
+                        "BLOCKED: Insufficient USDT for buy order",
+                        symbol=decision.symbol,
+                        quantity=decision.quantity,
+                        available_usdt=available_usdt,
+                    )
+                    results.append({
+                        "decision": decision.to_dict(),
+                        "executed": False,
+                        "blocked": True,
+                        "reason": f"Insufficient USDT (need {required_amount}, have {available_usdt})",
+                    })
+                    continue
+                else:
+                    # Deduct from available for subsequent orders in this cycle
+                    available_usdt -= required_amount
+            
             if dry_run:
                 logger.info(
                     "DRY RUN: Would execute",

@@ -12,15 +12,18 @@ from src.adapters.bitget.trade_fills_cache import TradeFillsCache
 from src.adapters.dynamodb.repository import DynamoDBStorageAdapter
 from src.adapters.dynamodb.analysis_history_repository import DynamoDBAnalysisHistoryAdapter
 from src.adapters.dynamodb.paper_trades_repository import DynamoDBPaperTradesAdapter
+from src.adapters.dynamodb.trade_outcome_repository import DynamoDBTradeOutcomeAdapter
 from src.adapters.fundamental.fundamental_data_service import FundamentalDataService
 from src.adapters.llm.deepseek_adapter import DeepSeekAdapter
 from src.adapters.llm.gemini_adapter import GeminiAdapter
 from src.adapters.storage.json_storage_adapter import JSONStorageAdapter
 from src.adapters.storage.json_analysis_history import JsonAnalysisHistoryAdapter
 from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
+from src.adapters.storage.json_trade_outcome import JsonTradeOutcomeAdapter
 from src.domain.ports.storage_port import StoragePort
 from src.domain.ports.analysis_history_port import AnalysisHistoryPort
 from src.domain.ports.paper_trades_port import PaperTradesPort
+from src.domain.ports.trade_outcome_port import TradeOutcomePort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
 from src.application.agents.gemini_analyst import GeminiAnalystAgent
@@ -105,6 +108,17 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
             cache_ttl_hours=settings.trade_fills_cache_ttl_hours,
         )
     
+    # Create trade outcome tracker (for P&L feedback loop)
+    trade_outcome_tracker: Optional[TradeOutcomePort] = None
+    if settings.storage_type.lower() == "dynamodb":
+        trade_outcome_tracker = DynamoDBTradeOutcomeAdapter(settings)
+        await trade_outcome_tracker.initialize_table()
+    else:
+        # JSON storage for trade outcomes
+        trade_outcome_tracker = JsonTradeOutcomeAdapter(
+            storage_path="data/trade_outcomes.json"
+        )
+    
     # Create adapters
     market_data_adapter = BitgetMarketDataAdapter(bitget_client, settings)
     trading_adapter = BitgetTradingAdapter(
@@ -112,6 +126,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         settings=settings,
         trade_fills_cache=trade_fills_cache,
         paper_trades_tracker=paper_trades_tracker,
+        trade_outcome_tracker=trade_outcome_tracker,
     )
     gemini_adapter = GeminiAdapter(settings)
     deepseek_adapter = DeepSeekAdapter(settings)
@@ -153,6 +168,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         trading_port=trading_adapter,
         settings=settings,
         market_data_port=market_data_adapter,
+        trade_outcome_port=trade_outcome_tracker,
     )
     
     # Create services

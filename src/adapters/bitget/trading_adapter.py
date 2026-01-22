@@ -19,6 +19,7 @@ from src.infrastructure.logging import get_logger
 if TYPE_CHECKING:
     from src.adapters.bitget.trade_fills_cache import TradeFillsCache
     from src.domain.ports.paper_trades_port import PaperTradesPort
+    from src.domain.ports.trade_outcome_port import TradeOutcomePort
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,7 @@ class BitgetTradingAdapter(TradingPort):
         settings: Settings,
         trade_fills_cache: Optional["TradeFillsCache"] = None,
         paper_trades_tracker: Optional["PaperTradesPort"] = None,
+        trade_outcome_tracker: Optional["TradeOutcomePort"] = None,
     ):
         """
         Initialize adapter.
@@ -46,12 +48,14 @@ class BitgetTradingAdapter(TradingPort):
             settings: Application settings
             trade_fills_cache: Optional cache for trade fills (live mode PNL)
             paper_trades_tracker: Optional tracker for paper trades (paper mode PNL)
+            trade_outcome_tracker: Optional tracker for trade outcomes (P&L tracking)
         """
         self.client = client
         self.settings = settings
         self.paper_mode = settings.trade_mode == "paper"
         self.trade_fills_cache = trade_fills_cache
         self.paper_trades_tracker = paper_trades_tracker
+        self.trade_outcome_tracker = trade_outcome_tracker
         
         # Paper trading state
         self._paper_portfolio: dict[str, PortfolioPosition] = {}
@@ -232,6 +236,7 @@ class BitgetTradingAdapter(TradingPort):
         size: str,
         price: Optional[str] = None,
         client_oid: Optional[str] = None,
+        reasoning: str = "",
     ) -> TradeExecutionResult:
         """Place a trading order."""
         if client_oid is None:
@@ -255,6 +260,7 @@ class BitgetTradingAdapter(TradingPort):
                 size=size,
                 price=price,
                 client_oid=client_oid,
+                reasoning=reasoning,
             )
         
         # Build order payload
@@ -332,6 +338,7 @@ class BitgetTradingAdapter(TradingPort):
             order_type=decision.order_type,
             size=decision.quantity,  # type: ignore
             price=decision.price,
+            reasoning=decision.reasoning,
         )
         
         decision.executed = True
@@ -393,6 +400,7 @@ class BitgetTradingAdapter(TradingPort):
         size: str,
         price: Optional[str],
         client_oid: str,
+        reasoning: str = "",
     ) -> TradeExecutionResult:
         """Simulate order placement in paper trading mode."""
         order_id = f"paper_{uuid.uuid4().hex[:12]}"
@@ -419,16 +427,57 @@ class BitgetTradingAdapter(TradingPort):
         
         self._paper_orders.append(paper_order)
         
+        # Extract coin from symbol (e.g., "BTCUSDT" -> "BTC")
+        coin = symbol.upper().replace("USDT", "")
+        quantity = float(size)
+        
         # Record trade in paper trades tracker for PNL tracking
         if status == "filled" and self.paper_trades_tracker and exec_price > 0:
-            # Extract coin from symbol (e.g., "BTCUSDT" -> "BTC")
-            coin = symbol.upper().replace("USDT", "")
-            quantity = float(size)
-            
             if side.lower() == "buy":
                 await self.paper_trades_tracker.record_buy(coin, quantity, exec_price)
             elif side.lower() == "sell":
                 await self.paper_trades_tracker.record_sell(coin, quantity, exec_price)
+        
+        # Record trade outcome for P&L tracking and feedback loop
+        if status == "filled" and self.trade_outcome_tracker and exec_price > 0:
+            try:
+                if side.lower() == "buy":
+                    await self.trade_outcome_tracker.record_entry(
+                        symbol=symbol,
+                        coin=coin,
+                        price=exec_price,
+                        quantity=quantity,
+                        reasoning=reasoning,
+                    )
+                    logger.info(
+                        "Trade entry recorded for outcome tracking",
+                        symbol=symbol,
+                        price=exec_price,
+                        quantity=quantity,
+                    )
+                elif side.lower() == "sell":
+                    closed_outcomes = await self.trade_outcome_tracker.record_exit(
+                        symbol=symbol,
+                        coin=coin,
+                        price=exec_price,
+                        quantity=quantity,
+                        reasoning=reasoning,
+                    )
+                    total_pnl = sum(o.realized_pnl or 0 for o in closed_outcomes)
+                    logger.info(
+                        "Trade exit recorded for outcome tracking",
+                        symbol=symbol,
+                        price=exec_price,
+                        quantity=quantity,
+                        closed_trades=len(closed_outcomes),
+                        realized_pnl=round(total_pnl, 2),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to record trade outcome (non-critical)",
+                    error=str(e),
+                    symbol=symbol,
+                )
         
         logger.info("Paper order placed", order=paper_order)
         
