@@ -405,12 +405,13 @@ class BitgetTradingAdapter(TradingPort):
         """Simulate order placement in paper trading mode."""
         order_id = f"paper_{uuid.uuid4().hex[:12]}"
         
-        # Simulate immediate fill for market orders
-        status = "filled" if order_type == "market" else "live"
+        # In paper mode, simulate immediate fill for ALL orders (both market and limit)
+        # This allows to track P&L and test the system without waiting for fills
+        status = "filled"
         
-        # Determine execution price (for market orders, fetch current price)
+        # Determine execution price
         exec_price = float(price) if price else 0.0
-        if order_type == "market" and not price:
+        if not price or exec_price <= 0:
             current_price = await self._get_current_price(symbol)
             exec_price = current_price if current_price else 0.0
         
