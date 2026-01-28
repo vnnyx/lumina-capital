@@ -112,16 +112,16 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
         """Record a paper buy trade."""
         coin = coin.upper()
         now = datetime.now()
-        
+
         # Get existing position
         existing = await self.get_position(coin)
-        
+
         if existing:
             # Update with weighted average
             new_total_cost = existing.total_cost + (quantity * price)
             new_quantity = existing.quantity + quantity
             new_avg_price = new_total_cost / new_quantity if new_quantity > 0 else 0
-            
+
             position = PaperPosition(
                 coin=coin,
                 quantity=new_quantity,
@@ -139,7 +139,7 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
                 created_at=now,
                 updated_at=now,
             )
-        
+
         # Save position
         try:
             item = convert_floats_to_decimal(position.to_dict())
@@ -149,18 +149,23 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
         except ClientError as e:
             logger.error("Failed to save paper position", error=str(e))
             raise
-        
+
+        # Deduct USDT for the purchase
+        usdt_spent = quantity * price
+        await self.deduct_usdt(usdt_spent)
+
         # Record trade history
         await self._record_trade("buy", coin, quantity, price)
-        
+
         logger.info(
             "Paper buy recorded",
             coin=coin,
             quantity=quantity,
             price=price,
             new_avg_price=position.avg_entry_price,
+            usdt_spent=usdt_spent,
         )
-        
+
         return position
 
     async def record_sell(
@@ -172,15 +177,15 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
         """Record a paper sell trade."""
         coin = coin.upper()
         now = datetime.now()
-        
+
         existing = await self.get_position(coin)
         if not existing:
             logger.warning("No paper position to sell", coin=coin)
             return None
-        
+
         new_quantity = existing.quantity - quantity
         realized_pnl = (price - existing.avg_entry_price) * quantity
-        
+
         if new_quantity <= 0:
             # Position fully closed - delete it
             try:
@@ -199,7 +204,7 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
                 created_at=existing.created_at,
                 updated_at=now,
             )
-            
+
             try:
                 item = convert_floats_to_decimal(position.to_dict())
                 item["pk"] = "POSITION"
@@ -208,20 +213,25 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
             except ClientError as e:
                 logger.error("Failed to update paper position", error=str(e))
                 raise
-            
+
             result = position
-        
+
+        # Add USDT from the sale
+        usdt_received = quantity * price
+        await self.add_usdt(usdt_received)
+
         # Record trade history
         await self._record_trade("sell", coin, quantity, price, realized_pnl)
-        
+
         logger.info(
             "Paper sell recorded",
             coin=coin,
             quantity=quantity,
             price=price,
             realized_pnl=realized_pnl,
+            usdt_received=usdt_received,
         )
-        
+
         return result
 
     async def _record_trade(
@@ -314,3 +324,127 @@ class DynamoDBPaperTradesAdapter(PaperTradesPort):
         except ClientError as e:
             logger.error("Failed to get trade history", error=str(e))
             return []
+
+    async def _get_balance_record(self) -> Optional[dict]:
+        """Get the current balance record from DynamoDB."""
+        try:
+            response = self.table.get_item(Key={"pk": "BALANCE", "sk": "USDT"})
+            item = response.get("Item")
+            if item:
+                return convert_decimals_to_float(item)
+            return None
+        except ClientError as e:
+            logger.error("Failed to get balance record", error=str(e))
+            return None
+
+    async def _save_balance_record(
+        self,
+        initial_balance: float,
+        current_balance: float,
+        last_known_real_balance: float,
+    ) -> None:
+        """Save balance record to DynamoDB."""
+        try:
+            item = {
+                "pk": "BALANCE",
+                "sk": "USDT",
+                "initial_balance": Decimal(str(initial_balance)),
+                "current_balance": Decimal(str(current_balance)),
+                "last_known_real_balance": Decimal(str(last_known_real_balance)),
+                "updated_at": datetime.now().isoformat(),
+            }
+            self.table.put_item(Item=item)
+            logger.debug(
+                "Balance record saved",
+                current_balance=current_balance,
+                last_known_real=last_known_real_balance,
+            )
+        except ClientError as e:
+            logger.error("Failed to save balance record", error=str(e))
+            raise
+
+    async def initialize_balance(self, real_balance: float) -> None:
+        """
+        Initialize paper USDT balance from exchange.
+
+        If balance already initialized, this is a no-op.
+        """
+        existing = await self._get_balance_record()
+        if existing:
+            logger.debug("Balance already initialized", current=existing.get("current_balance"))
+            return
+
+        await self._save_balance_record(
+            initial_balance=real_balance,
+            current_balance=real_balance,
+            last_known_real_balance=real_balance,
+        )
+        logger.info("Paper balance initialized", balance=real_balance)
+
+    async def get_paper_usdt_balance(self, current_real_balance: float) -> float:
+        """
+        Get paper USDT balance, adjusting for deposits.
+
+        If real balance increased since last check, user deposited funds.
+        The difference is added to paper balance.
+        """
+        record = await self._get_balance_record()
+
+        if not record:
+            # First access - initialize with real balance
+            await self.initialize_balance(current_real_balance)
+            return current_real_balance
+
+        current_balance = float(record.get("current_balance", 0))
+        last_known_real = float(record.get("last_known_real_balance", 0))
+
+        # Detect deposits: real balance increased
+        if current_real_balance > last_known_real:
+            deposit_amount = current_real_balance - last_known_real
+            current_balance += deposit_amount
+            logger.info(
+                "Deposit detected, adjusting paper balance",
+                deposit=deposit_amount,
+                new_balance=current_balance,
+            )
+            await self._save_balance_record(
+                initial_balance=float(record.get("initial_balance", 0)),
+                current_balance=current_balance,
+                last_known_real_balance=current_real_balance,
+            )
+
+        return current_balance
+
+    async def deduct_usdt(self, amount: float) -> None:
+        """Deduct USDT when buying coins."""
+        record = await self._get_balance_record()
+        if not record:
+            logger.warning("No balance record to deduct from")
+            return
+
+        current_balance = float(record.get("current_balance", 0))
+        new_balance = current_balance - amount
+
+        await self._save_balance_record(
+            initial_balance=float(record.get("initial_balance", 0)),
+            current_balance=new_balance,
+            last_known_real_balance=float(record.get("last_known_real_balance", 0)),
+        )
+        logger.debug("USDT deducted", amount=amount, new_balance=new_balance)
+
+    async def add_usdt(self, amount: float) -> None:
+        """Add USDT when selling coins."""
+        record = await self._get_balance_record()
+        if not record:
+            logger.warning("No balance record to add to")
+            return
+
+        current_balance = float(record.get("current_balance", 0))
+        new_balance = current_balance + amount
+
+        await self._save_balance_record(
+            initial_balance=float(record.get("initial_balance", 0)),
+            current_balance=new_balance,
+            last_known_real_balance=float(record.get("last_known_real_balance", 0)),
+        )
+        logger.debug("USDT added", amount=amount, new_balance=new_balance)

@@ -18,6 +18,7 @@ from src.infrastructure.logging import get_logger
 
 if TYPE_CHECKING:
     from src.adapters.bitget.trade_fills_cache import TradeFillsCache
+    from src.adapters.notifications.slack_notifier import SlackNotifier
     from src.domain.ports.paper_trades_port import PaperTradesPort
     from src.domain.ports.trade_outcome_port import TradeOutcomePort
 
@@ -39,16 +40,18 @@ class BitgetTradingAdapter(TradingPort):
         trade_fills_cache: Optional["TradeFillsCache"] = None,
         paper_trades_tracker: Optional["PaperTradesPort"] = None,
         trade_outcome_tracker: Optional["TradeOutcomePort"] = None,
+        slack_notifier: Optional["SlackNotifier"] = None,
     ):
         """
         Initialize adapter.
-        
+
         Args:
             client: Bitget HTTP client
             settings: Application settings
             trade_fills_cache: Optional cache for trade fills (live mode PNL)
             paper_trades_tracker: Optional tracker for paper trades (paper mode PNL)
             trade_outcome_tracker: Optional tracker for trade outcomes (P&L tracking)
+            slack_notifier: Optional Slack notifier for trade notifications
         """
         self.client = client
         self.settings = settings
@@ -56,7 +59,8 @@ class BitgetTradingAdapter(TradingPort):
         self.trade_fills_cache = trade_fills_cache
         self.paper_trades_tracker = paper_trades_tracker
         self.trade_outcome_tracker = trade_outcome_tracker
-        
+        self.slack_notifier = slack_notifier
+
         # Paper trading state
         self._paper_portfolio: dict[str, PortfolioPosition] = {}
         self._paper_orders: list[dict] = []
@@ -64,20 +68,20 @@ class BitgetTradingAdapter(TradingPort):
     async def get_portfolio(self) -> Portfolio:
         """Fetch current portfolio holdings with PNL enrichment."""
         logger.info("Fetching portfolio", paper_mode=self.paper_mode)
-        
+
         if self.paper_mode and self._paper_portfolio:
             positions = list(self._paper_portfolio.values())
             portfolio = Portfolio(positions=positions)
             # Enrich with PNL data for paper mode
             await self._enrich_portfolio_pnl(portfolio)
             return portfolio
-        
+
         data = await self.client.get(
             "/api/v2/spot/account/assets",
             params={"assetType": "hold_only"},
             authenticated=True,
         )
-        
+
         positions = [
             PortfolioPosition(
                 coin=item.get("coin", ""),
@@ -88,18 +92,46 @@ class BitgetTradingAdapter(TradingPort):
             )
             for item in data
         ]
-        
+
         portfolio = Portfolio(positions=positions)
-        
+
+        # In paper mode, use simulated USDT balance instead of real exchange balance
+        if self.paper_mode and self.paper_trades_tracker:
+            real_usdt_balance = portfolio.usdt_balance
+            paper_usdt_balance = await self.paper_trades_tracker.get_paper_usdt_balance(
+                real_usdt_balance
+            )
+            # Update USDT position in portfolio
+            for pos in portfolio.positions:
+                if pos.coin.upper() == "USDT":
+                    pos.available = str(paper_usdt_balance)
+                    break
+            else:
+                # No USDT position found, add one
+                portfolio.positions.append(
+                    PortfolioPosition(
+                        coin="USDT",
+                        available=str(paper_usdt_balance),
+                        frozen="0",
+                        locked="0",
+                        updated_at=0,
+                    )
+                )
+            logger.info(
+                "Using paper USDT balance",
+                real_balance=real_usdt_balance,
+                paper_balance=paper_usdt_balance,
+            )
+
         # Enrich with PNL data
         await self._enrich_portfolio_pnl(portfolio)
-        
+
         logger.info(
             "Portfolio fetched",
             total_positions=portfolio.total_positions,
             usdt_balance=portfolio.usdt_balance,
         )
-        
+
         return portfolio
     
     async def get_asset_balance(self, coin: str) -> Optional[str]:
@@ -312,7 +344,7 @@ class BitgetTradingAdapter(TradingPort):
             action=decision.action.value,
             quantity=decision.quantity,
         )
-        
+
         if decision.action == TradeAction.HOLD:
             return TradeExecutionResult(
                 order_id="",
@@ -321,7 +353,7 @@ class BitgetTradingAdapter(TradingPort):
                 status="no_action",
                 success=True,
             )
-        
+
         if not decision.is_actionable:
             logger.warning("Decision not actionable", decision=decision.to_dict())
             return TradeExecutionResult(
@@ -331,23 +363,52 @@ class BitgetTradingAdapter(TradingPort):
                 success=False,
                 error_message="Decision missing required fields",
             )
-        
+
+        # For BUY orders, convert coin quantity to USDT amount for Bitget API
+        # (Bitget expects USDT amount for market buy orders)
+        size = decision.quantity  # type: ignore
+        if decision.action == TradeAction.BUY and not self.paper_mode:
+            # Fetch current price and convert to USDT
+            current_price = await self._get_current_price(decision.symbol)
+            if not current_price:
+                logger.error(
+                    "Cannot execute BUY: failed to get current price",
+                    symbol=decision.symbol,
+                )
+                return TradeExecutionResult(
+                    order_id="",
+                    symbol=decision.symbol,
+                    side="buy",
+                    status="failed",
+                    success=False,
+                    error_message="Failed to fetch current price for quantity conversion",
+                )
+            coin_quantity = float(decision.quantity)  # type: ignore
+            usdt_amount = coin_quantity * current_price
+            size = str(usdt_amount)
+            logger.info(
+                "Converted coin quantity to USDT for BUY order",
+                coin_quantity=coin_quantity,
+                price=current_price,
+                usdt_amount=usdt_amount,
+            )
+
         result = await self.place_order(
             symbol=decision.symbol,
             side=decision.action.value,
             order_type=decision.order_type,
-            size=decision.quantity,  # type: ignore
+            size=size,
             price=decision.price,
             reasoning=decision.reasoning,
         )
-        
+
         decision.executed = True
         decision.execution_result = {
             "order_id": result.order_id,
             "status": result.status,
             "success": result.success,
         }
-        
+
         return result
     
     async def get_order_info(self, order_id: str) -> Optional[dict]:
@@ -479,9 +540,44 @@ class BitgetTradingAdapter(TradingPort):
                     error=str(e),
                     symbol=symbol,
                 )
-        
+
+        # Send Slack notification (fire and forget)
+        if status == "filled" and self.slack_notifier and exec_price > 0:
+            try:
+                pnl_info = None
+                if side.lower() == "sell" and self.trade_outcome_tracker:
+                    # Try to get PNL info for the sell
+                    try:
+                        position = await self.paper_trades_tracker.get_position(coin) if self.paper_trades_tracker else None
+                        if position:
+                            entry_price = position.avg_entry_price
+                            realized_pnl = (exec_price - entry_price) * quantity
+                            pnl_pct = ((exec_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                            pnl_info = {
+                                "realized_pnl": realized_pnl,
+                                "pnl_pct": pnl_pct,
+                            }
+                    except Exception:
+                        pass  # PNL info is optional
+
+                await self.slack_notifier.send_trade_notification(
+                    action=side.upper(),
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=exec_price,
+                    total_usdt=quantity * exec_price,
+                    reasoning=reasoning,
+                    pnl_info=pnl_info,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to send Slack notification (non-critical)",
+                    error=str(e),
+                    symbol=symbol,
+                )
+
         logger.info("Paper order placed", order=paper_order)
-        
+
         return TradeExecutionResult(
             order_id=order_id,
             client_order_id=client_oid,

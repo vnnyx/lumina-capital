@@ -143,6 +143,74 @@ class Settings(BaseSettings):
         default=1,
         description="Hours before trade fills cache is refreshed",
     )
+
+    # Coin Screening Configuration
+    screening_enabled: bool = Field(
+        default=True,
+        description="Enable smart coin screening (vs simple top-N by volume)",
+    )
+    screening_result_limit: int = Field(
+        default=10,
+        description="Number of coins to return after screening",
+    )
+
+    # Price filters (percentage)
+    screen_price_change_24h_min: float = Field(
+        default=15.0,
+        description="Minimum 24h price change % for sweet spot scoring",
+    )
+    screen_price_change_24h_max: float = Field(
+        default=50.0,
+        description="Maximum 24h price change % for sweet spot scoring",
+    )
+    screen_price_change_7d_min: float = Field(
+        default=30.0,
+        description="Minimum 7d price change % for sweet spot scoring",
+    )
+    screen_price_change_7d_max: float = Field(
+        default=100.0,
+        description="Maximum 7d price change % for sweet spot scoring",
+    )
+    screen_pump_dump_threshold: float = Field(
+        default=200.0,
+        description="24h change % above this is excluded (pump & dump)",
+    )
+
+    # Volume spike filters
+    screen_volume_spike_min: float = Field(
+        default=2.0,
+        description="Minimum volume spike ratio for healthy volume",
+    )
+    screen_volume_spike_max: float = Field(
+        default=5.0,
+        description="Maximum volume spike ratio for healthy volume",
+    )
+
+    # Market cap filters (USD)
+    screen_market_cap_min: float = Field(
+        default=10_000_000,
+        description="Minimum market cap in USD",
+    )
+    screen_market_cap_max: float = Field(
+        default=500_000_000,
+        description="Maximum market cap in USD",
+    )
+
+    # Coin age filter
+    screen_min_coin_age_days: int = Field(
+        default=30,
+        description="Minimum coin age in days (hard filter)",
+    )
+
+    # Slack Notifications Configuration
+    slack_webhook_url: Optional[str] = Field(
+        default=None,
+        description="Slack webhook URL for trade notifications",
+    )
+    slack_notifications_enabled: bool = Field(
+        default=False,
+        description="Enable Slack trade notifications",
+    )
     
     @property
     def is_live_trading(self) -> bool:

@@ -102,3 +102,52 @@ class PaperTradesPort(ABC):
     async def get_trade_history(self, limit: int = 100) -> list[dict]:
         """Get recent trade history."""
         ...
+
+    @abstractmethod
+    async def initialize_balance(self, real_balance: float) -> None:
+        """
+        Initialize paper USDT balance from exchange.
+
+        Should only be called once when paper trading starts.
+        If balance already initialized, this is a no-op.
+
+        Args:
+            real_balance: Current USDT balance from exchange.
+        """
+        ...
+
+    @abstractmethod
+    async def get_paper_usdt_balance(self, current_real_balance: float) -> float:
+        """
+        Get paper USDT balance, adjusting for deposits.
+
+        If real balance increased since last check, user deposited funds.
+        The difference is added to paper balance.
+
+        Args:
+            current_real_balance: Current USDT balance from exchange.
+
+        Returns:
+            Current paper USDT balance.
+        """
+        ...
+
+    @abstractmethod
+    async def deduct_usdt(self, amount: float) -> None:
+        """
+        Deduct USDT when buying coins.
+
+        Args:
+            amount: USDT amount spent (quantity * price).
+        """
+        ...
+
+    @abstractmethod
+    async def add_usdt(self, amount: float) -> None:
+        """
+        Add USDT when selling coins.
+
+        Args:
+            amount: USDT amount received (quantity * price).
+        """
+        ...

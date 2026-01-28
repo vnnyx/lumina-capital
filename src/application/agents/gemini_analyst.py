@@ -4,7 +4,7 @@ Gemini Analyst Agent - Market data analysis using Gemini 3 Pro.
 
 import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from src.domain.entities.analysis_history import AnalysisHistoryEntry
 from src.domain.entities.coin_analysis import CoinAnalysis, GeminiInsight
@@ -15,7 +15,11 @@ from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.domain.ports.llm_port import LLMMessage, LLMPort
 from src.domain.ports.market_data_port import MarketDataPort
 from src.domain.ports.storage_port import StoragePort
+from src.infrastructure.config import Settings
 from src.infrastructure.logging import get_logger
+
+if TYPE_CHECKING:
+    from src.application.services.coin_screener import CoinScreenerService
 
 logger = get_logger(__name__)
 
@@ -206,22 +210,28 @@ You MUST respond with valid JSON matching the exact schema provided. Be specific
         storage_port: StoragePort,
         fundamental_data_port: Optional[FundamentalDataPort] = None,
         analysis_history_port: Optional[AnalysisHistoryPort] = None,
+        coin_screener: Optional["CoinScreenerService"] = None,
+        settings: Optional[Settings] = None,
     ):
         """
         Initialize the Gemini analyst agent.
-        
+
         Args:
             llm: LLM adapter (Gemini)
             market_data_port: Market data source
             storage_port: Storage for analysis results
             fundamental_data_port: Optional fundamental data source
             analysis_history_port: Optional history storage for prompt fine-tuning
+            coin_screener: Optional coin screener service for smart filtering
+            settings: Optional application settings
         """
         self.llm = llm
         self.market_data = market_data_port
         self.storage = storage_port
         self.fundamental_data = fundamental_data_port
         self.analysis_history = analysis_history_port
+        self.coin_screener = coin_screener
+        self.settings = settings
         self._cached_fundamental_data: Optional[FundamentalData] = None
     
     async def _build_history_context(self, ticker: str) -> str:
@@ -515,37 +525,61 @@ Use these stats to calibrate your confidence. {"Higher confidence is justified."
     ) -> list[CoinAnalysis]:
         """
         Analyze top coins by volume plus additional symbols.
-        
+
+        If screening is enabled and a coin_screener is available, uses smart
+        filtering to select the best candidates. Otherwise falls back to
+        simple top-N by volume.
+
         Args:
-            limit: Number of top coins to analyze
+            limit: Number of top coins to analyze (or initial pool for screening)
             include_symbols: Additional symbols to include (e.g., portfolio holdings)
                             These will be deduplicated against top coins.
-            
+
         Returns:
             List of completed analyses.
         """
+        screening_enabled = (
+            self.settings and self.settings.screening_enabled and self.coin_screener
+        )
+
         logger.info(
             "Starting analysis of top coins",
             limit=limit,
+            screening_enabled=screening_enabled,
             additional_symbols=len(include_symbols) if include_symbols else 0,
         )
-        
-        # Fetch top coins by volume
-        top_tickers = await self.market_data.get_top_coins_by_volume(limit=limit)
-        
-        # Filter out stablecoins (they provide no trading alpha)
-        original_count = len(top_tickers)
-        top_tickers = [
-            t for t in top_tickers
-            if t.symbol.replace("USDT", "") not in STABLECOIN_TICKERS
-        ]
-        filtered_count = original_count - len(top_tickers)
-        if filtered_count > 0:
+
+        # Use smart screening if enabled
+        if screening_enabled:
+            screened_coins = await self.coin_screener.screen_coins(initial_limit=limit)
+            # Convert screened coins to ticker-like objects for processing
+            top_tickers = []
+            for sc in screened_coins:
+                ticker = await self.market_data.get_ticker(sc.symbol)
+                if ticker:
+                    top_tickers.append(ticker)
             logger.info(
-                "Filtered stablecoins from analysis",
-                filtered=filtered_count,
-                remaining=len(top_tickers),
+                "Using screened coins",
+                screened_count=len(screened_coins),
+                top_scores=[sc.score for sc in screened_coins[:5]],
             )
+        else:
+            # Fetch top coins by volume (original behavior)
+            top_tickers = await self.market_data.get_top_coins_by_volume(limit=limit)
+
+            # Filter out stablecoins (they provide no trading alpha)
+            original_count = len(top_tickers)
+            top_tickers = [
+                t for t in top_tickers
+                if t.symbol.replace("USDT", "") not in STABLECOIN_TICKERS
+            ]
+            filtered_count = original_count - len(top_tickers)
+            if filtered_count > 0:
+                logger.info(
+                    "Filtered stablecoins from analysis",
+                    filtered=filtered_count,
+                    remaining=len(top_tickers),
+                )
         
         # Build set of symbols already in top coins for deduplication
         top_symbols_set = {t.symbol for t in top_tickers}

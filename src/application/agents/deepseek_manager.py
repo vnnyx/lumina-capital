@@ -125,7 +125,7 @@ You receive your historical trade performance data. CRITICAL: Use this to improv
 Return a JSON object with your decisions. Each decision should include:
 - symbol: Trading pair (e.g., "BTCUSDT")
 - action: "buy", "sell", or "hold"
-- quantity: Amount to trade (in quote currency for buys, base currency for sells)
+- quantity: Amount of coins to trade (for both buys and sells)
 - reasoning: Your detailed reasoning
 - confidence: Your confidence level (0.0 to 1.0)
 - priority: Execution priority (higher = execute first)
@@ -618,12 +618,55 @@ Remember: You have FULL AUTONOMY. Make the decisions you believe are best for po
         for decision in actionable:
             # Block buy orders when there's no USDT available
             if decision.action == TradeAction.BUY:
-                required_amount = float(decision.quantity) if decision.quantity else 0
+                coin_quantity = float(decision.quantity) if decision.quantity else 0
+
+                # Calculate required USDT: coin_quantity * current_price
+                required_amount = 0.0
+                if coin_quantity > 0 and self.market_data:
+                    try:
+                        ticker = await self.market_data.get_ticker(decision.symbol)
+                        if ticker and ticker.last_price:
+                            current_price = float(ticker.last_price)
+                            required_amount = coin_quantity * current_price
+                            logger.debug(
+                                "Calculated required USDT for BUY",
+                                symbol=decision.symbol,
+                                coin_quantity=coin_quantity,
+                                price=current_price,
+                                required_usdt=required_amount,
+                            )
+                        else:
+                            logger.warning(
+                                "Could not fetch price, blocking BUY order",
+                                symbol=decision.symbol,
+                            )
+                            results.append({
+                                "decision": decision.to_dict(),
+                                "executed": False,
+                                "blocked": True,
+                                "reason": "Could not fetch current price for validation",
+                            })
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            "Price fetch failed, blocking BUY order",
+                            symbol=decision.symbol,
+                            error=str(e),
+                        )
+                        results.append({
+                            "decision": decision.to_dict(),
+                            "executed": False,
+                            "blocked": True,
+                            "reason": f"Price fetch failed: {e}",
+                        })
+                        continue
+
                 if available_usdt <= 0:
                     logger.warning(
                         "BLOCKED: Cannot buy with 0 USDT",
                         symbol=decision.symbol,
                         quantity=decision.quantity,
+                        required_usdt=required_amount,
                         available_usdt=available_usdt,
                     )
                     results.append({
@@ -637,14 +680,15 @@ Remember: You have FULL AUTONOMY. Make the decisions you believe are best for po
                     logger.warning(
                         "BLOCKED: Insufficient USDT for buy order",
                         symbol=decision.symbol,
-                        quantity=decision.quantity,
+                        coin_quantity=coin_quantity,
+                        required_usdt=required_amount,
                         available_usdt=available_usdt,
                     )
                     results.append({
                         "decision": decision.to_dict(),
                         "executed": False,
                         "blocked": True,
-                        "reason": f"Insufficient USDT (need {required_amount}, have {available_usdt})",
+                        "reason": f"Insufficient USDT (need {required_amount:.2f}, have {available_usdt:.2f})",
                     })
                     continue
                 else:

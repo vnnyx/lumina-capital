@@ -16,6 +16,7 @@ from src.adapters.dynamodb.trade_outcome_repository import DynamoDBTradeOutcomeA
 from src.adapters.fundamental.fundamental_data_service import FundamentalDataService
 from src.adapters.llm.deepseek_adapter import DeepSeekAdapter
 from src.adapters.llm.gemini_adapter import GeminiAdapter
+from src.adapters.notifications.slack_notifier import SlackNotifier
 from src.adapters.storage.json_storage_adapter import JSONStorageAdapter
 from src.adapters.storage.json_analysis_history import JsonAnalysisHistoryAdapter
 from src.adapters.storage.paper_trades_tracker import PaperTradesTracker
@@ -27,6 +28,7 @@ from src.domain.ports.trade_outcome_port import TradeOutcomePort
 from src.domain.ports.fundamental_data_port import FundamentalDataPort
 from src.application.agents.deepseek_manager import DeepSeekManagerAgent
 from src.application.agents.gemini_analyst import GeminiAnalystAgent
+from src.application.services.coin_screener import CoinScreenerService
 from src.application.services.outcome_backfill import OutcomeBackfillService
 from src.application.use_cases.investment_cycle import InvestmentCycleUseCase
 from src.infrastructure.config import Settings
@@ -118,7 +120,12 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         trade_outcome_tracker = JsonTradeOutcomeAdapter(
             storage_path="data/trade_outcomes.json"
         )
-    
+
+    # Create Slack notifier if enabled
+    slack_notifier: Optional[SlackNotifier] = None
+    if settings.slack_notifications_enabled and settings.slack_webhook_url:
+        slack_notifier = SlackNotifier(webhook_url=settings.slack_webhook_url)
+
     # Create adapters
     market_data_adapter = BitgetMarketDataAdapter(bitget_client, settings)
     trading_adapter = BitgetTradingAdapter(
@@ -127,6 +134,7 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         trade_fills_cache=trade_fills_cache,
         paper_trades_tracker=paper_trades_tracker,
         trade_outcome_tracker=trade_outcome_tracker,
+        slack_notifier=slack_notifier,
     )
     gemini_adapter = GeminiAdapter(settings)
     deepseek_adapter = DeepSeekAdapter(settings)
@@ -152,7 +160,16 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
             cache_path=settings.fundamental_cache_path,
             coingecko_api_key=settings.coingecko_api_key,
         )
-    
+
+    # Create coin screener service if screening is enabled
+    coin_screener: Optional[CoinScreenerService] = None
+    if settings.screening_enabled:
+        coin_screener = CoinScreenerService(
+            market_data_port=market_data_adapter,
+            fundamental_data_port=fundamental_data_service,
+            settings=settings,
+        )
+
     # Create agents
     analyst_agent = GeminiAnalystAgent(
         llm=gemini_adapter,
@@ -160,6 +177,8 @@ async def create_container(settings: Optional[Settings] = None) -> Container:
         storage_port=storage_adapter,
         fundamental_data_port=fundamental_data_service,
         analysis_history_port=analysis_history_adapter,
+        coin_screener=coin_screener,
+        settings=settings,
     )
     
     manager_agent = DeepSeekManagerAgent(
